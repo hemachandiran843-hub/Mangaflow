@@ -1,0 +1,6 @@
+{
+  "name": "MangaFlow",
+  "description": "Android mobile browser with integrated manhwa tracking, ad blocking, private browsing, and reading stats.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
