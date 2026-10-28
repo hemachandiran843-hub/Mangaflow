@@ -42,13 +42,11 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -85,7 +83,6 @@ fun HomeScreen(
     val seriesList by app.trackerService.allSeries.collectAsState(initial = emptyList())
     val stats by app.trackerService.getReadingStatistics().collectAsState(initial = ReadingStatistics())
     val scrollState = rememberScrollState()
-    val scope = rememberCoroutineScope()
 
     val continueManhwa = seriesList.firstOrNull { it.readingStatus == "READING" } ?: seriesList.firstOrNull()
     val recentlyReadList = seriesList.sortedByDescending { it.lastReadTimestamp }.take(6)
@@ -211,17 +208,6 @@ fun HomeScreen(
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Add Series", fontSize = 12.sp)
                         }
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch {
-                                    app.trackerService.loadSampleData()
-                                }
-                            },
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Sample Library", fontSize = 12.sp)
-                        }
                     }
                 }
             }
@@ -289,8 +275,11 @@ fun HomeScreen(
                             )
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Progress bar
-                            val progressFloat = (continueManhwa.currentChapterNum / continueManhwa.totalChapters.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+                            // Unknown totals stay unknown; do not invent a denominator just to show a percentage.
+                            val hasKnownTotal = continueManhwa.totalChapters > 0
+                            val progressFloat = if (hasKnownTotal) {
+                                (continueManhwa.currentChapterNum / continueManhwa.totalChapters.toFloat()).coerceIn(0f, 1f)
+                            } else 0f
                             LinearProgressIndicator(
                                 progress = { progressFloat },
                                 color = MaterialTheme.colorScheme.primary,
@@ -302,7 +291,11 @@ fun HomeScreen(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "${(progressFloat * 100).toInt()}% completed (${continueManhwa.lastReadChapterIdentifier}/${continueManhwa.totalChapters})",
+                                text = if (hasKnownTotal) {
+                                    "${(progressFloat * 100).toInt()}% completed (${continueManhwa.lastReadChapterIdentifier}/${continueManhwa.totalChapters})"
+                                } else {
+                                    "Completion percentage unavailable; total chapter count is unknown."
+                                },
                                 color = TextSecondary,
                                 fontSize = 10.sp
                             )

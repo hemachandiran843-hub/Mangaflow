@@ -41,7 +41,8 @@ class ManhwaTrackerServiceTest {
             chapterDao = database.chapterDao(),
             readingProgressDao = database.readingProgressDao(),
             readingSessionDao = database.readingSessionDao(),
-            notificationDao = database.notificationDao()
+            notificationDao = database.notificationDao(),
+            database = database
         )
     }
 
@@ -252,6 +253,7 @@ class ManhwaTrackerServiceTest {
         var stats = trackerService.getReadingStatistics().first()
         assertEquals(1, stats.totalChaptersRead)
         assertEquals(4, stats.totalUnreadChapters)
+        assertEquals(0f, stats.totalHoursRead, 0f)
 
         // Mark ch1 as unread
         trackerService.markChapterReadState(seriesId, ch1.id, false)
@@ -306,5 +308,37 @@ class ManhwaTrackerServiceTest {
         assertEquals(3, restoredChapters.size)
         assertTrue(restoredChapters[0].isRead)
         assertFalse(restoredChapters[1].isRead)
+    }
+
+    @Test
+    fun testImportPreviewValidatesAndSkipsDuplicatesWithoutOverwriting() = runBlocking {
+        val json = """
+            {
+              "format":"mangaflow-library",
+              "version":3,
+              "series":[
+                {"title":"New Series","sourceUrl":"https://example.com/new-series","readingStatus":"READING","chapters":[]},
+                {"title":"Bad URL","sourceUrl":"javascript:alert(1)","readingStatus":"READING","chapters":[]}
+              ]
+            }
+        """.trimIndent()
+
+        val preview = trackerService.previewLibraryJson(json).getOrThrow()
+        assertEquals(2, preview.totalEntries)
+        assertEquals(1, preview.importableCount)
+        assertEquals(1, preview.invalidEntries.size)
+        assertEquals(1, trackerService.applyLibraryImport(preview).getOrThrow())
+
+        trackerService.changeReadingStatus(
+            database.seriesDao().findBySourceUrl("https://example.com/new-series")!!.id,
+            "COMPLETED"
+        )
+        val duplicatePreview = trackerService.previewLibraryJson(json).getOrThrow()
+        assertEquals(0, duplicatePreview.importableCount)
+        assertEquals(1, duplicatePreview.duplicateCount)
+        assertEquals(0, trackerService.applyLibraryImport(duplicatePreview).getOrThrow())
+        assertEquals("COMPLETED", database.seriesDao().findBySourceUrl("https://example.com/new-series")!!.readingStatus)
+
+        assertTrue(trackerService.previewLibraryJson("{ malformed json").isFailure)
     }
 }

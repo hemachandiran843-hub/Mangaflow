@@ -35,7 +35,9 @@ class ManhwaRepository(
             readingStatus = manhwa.readingStatus,
             rating = manhwa.rating,
             description = manhwa.description,
-            initialChapterCount = manhwa.totalChapters.coerceAtLeast(1)
+            initialChapterCount = manhwa.totalChapters.coerceAtLeast(0),
+            sourceId = manhwa.sourceId,
+            sourceName = manhwa.sourceName
         )
     }
 

@@ -1,5 +1,9 @@
 package com.example.ui.screens.library
 
+import android.content.Context
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -54,7 +58,6 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -77,6 +80,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -85,6 +89,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.example.data.local.entity.SeriesEntity
+import com.example.data.tracker.LibraryImportPreview
 import com.example.ui.theme.MangaAdShield
 import com.example.ui.theme.MangaGold
 import com.example.ui.theme.MangaPrimary
@@ -110,6 +115,7 @@ fun LibraryScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
 
     var isGridView by remember { mutableStateOf(false) }
     var showSortMenu by remember { mutableStateOf(false) }
@@ -124,6 +130,37 @@ fun LibraryScreen(
     var exportedJsonText by remember { mutableStateOf("") }
     var showImportDialog by remember { mutableStateOf(false) }
     var importJsonInput by remember { mutableStateOf("") }
+    var importPreview by remember { mutableStateOf<LibraryImportPreview?>(null) }
+    var showImportPreviewDialog by remember { mutableStateOf(false) }
+    var isImportPreviewLoading by remember { mutableStateOf(false) }
+
+    val exportFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { output ->
+                    output.write(exportedJsonText.toByteArray(Charsets.UTF_8))
+                } ?: throw IllegalStateException("Could not open the selected file")
+                scope.launch { snackbarHostState.showSnackbar("Library export saved") }
+                showExportDialog = false
+            } catch (e: Exception) {
+                scope.launch { snackbarHostState.showSnackbar("Could not save export: ${e.message ?: "file error"}") }
+            }
+        }
+    }
+    val importFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                importJsonInput = readUtf8Limited(context, uri)
+                showImportDialog = true
+            } catch (e: Exception) {
+                scope.launch { snackbarHostState.showSnackbar("Could not read JSON file: ${e.message ?: "invalid file"}") }
+            }
+        }
+    }
 
     LaunchedEffect(actionMessage) {
         actionMessage?.let { msg ->
@@ -225,7 +262,7 @@ fun LibraryScreen(
                         )
                     }
 
-                    // Overflow Menu (Import/Export, Clear, Load Sample)
+                    // Overflow Menu (Import/Export and clear)
                     Box {
                         IconButton(onClick = { showMoreMenu = true }) {
                             Icon(imageVector = Icons.Default.MoreVert, contentDescription = "More actions", tint = TextPrimary)
@@ -235,13 +272,6 @@ fun LibraryScreen(
                             onDismissRequest = { showMoreMenu = false },
                             modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant)
                         ) {
-                            DropdownMenuItem(
-                                text = { Text("Load Sample Library", color = TextPrimary) },
-                                onClick = {
-                                    showMoreMenu = false
-                                    viewModel.loadSampleData()
-                                }
-                            )
                             DropdownMenuItem(
                                 text = { Text("Export Library (JSON)", color = TextPrimary) },
                                 onClick = {
@@ -355,7 +385,7 @@ fun LibraryScreen(
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = if (searchQuery.isNotEmpty()) "Try a different search query" else "Add your favorite manhwa manually or explore sample titles with one tap.",
+                            text = if (searchQuery.isNotEmpty()) "Try a different search query" else "Add a series manually or import your existing library."
                             color = TextSecondary,
                             fontSize = 13.sp,
                             lineHeight = 18.sp,
@@ -371,12 +401,6 @@ fun LibraryScreen(
                                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text("Add Series")
-                            }
-                            OutlinedButton(
-                                onClick = { viewModel.loadSampleData() },
-                                shape = RoundedCornerShape(10.dp)
-                            ) {
-                                Text("Load Sample Data")
                             }
                         }
                     }
@@ -517,10 +541,10 @@ fun LibraryScreen(
     if (showExportDialog) {
         AlertDialog(
             onDismissRequest = { showExportDialog = false },
-            title = { Text("Exported Library JSON") },
+            title = { Text("Portable Library Export") },
             text = {
                 Column {
-                    Text("Your entire library data is serialized below in standard JSON format:", fontSize = 12.sp, color = TextSecondary)
+                    Text("This versioned JSON includes series metadata and progress, but excludes page content, private browsing data and browser history.", fontSize = 12.sp, color = TextSecondary)
                     Spacer(modifier = Modifier.height(8.dp))
                     Box(
                         modifier = Modifier
@@ -535,12 +559,17 @@ fun LibraryScreen(
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    clipboardManager.setText(AnnotatedString(exportedJsonText))
-                    scope.launch { snackbarHostState.showSnackbar("JSON copied to clipboard") }
-                    showExportDialog = false
-                }) {
-                    Text("Copy to Clipboard")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { exportFileLauncher.launch("mangaflow-library.json") }) {
+                        Text("Save .json")
+                    }
+                    Button(onClick = {
+                        clipboardManager.setText(AnnotatedString(exportedJsonText))
+                        scope.launch { snackbarHostState.showSnackbar("JSON copied to clipboard") }
+                        showExportDialog = false
+                    }) {
+                        Text("Copy")
+                    }
                 }
             },
             dismissButton = {
@@ -558,7 +587,16 @@ fun LibraryScreen(
             title = { Text("Import Library JSON") },
             text = {
                 Column {
-                    Text("Paste a MangaFlow library JSON export below:", fontSize = 12.sp, color = TextSecondary)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Choose an export file or paste JSON:", fontSize = 12.sp, color = TextSecondary, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { importFileLauncher.launch(arrayOf("application/json", "text/json", "text/plain")) }) {
+                            Text("Choose file")
+                        }
+                    }
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
                         value = importJsonInput,
@@ -578,23 +616,66 @@ fun LibraryScreen(
                 Button(
                     onClick = {
                         if (importJsonInput.isNotBlank()) {
-                            viewModel.importLibrary(importJsonInput) { res ->
-                                if (res.isFailure) {
-                                    scope.launch { snackbarHostState.showSnackbar("Failed to import JSON: ${res.exceptionOrNull()?.message}") }
+                            isImportPreviewLoading = true
+                            viewModel.previewLibraryImport(importJsonInput) { result ->
+                                isImportPreviewLoading = false
+                                result.onSuccess { preview ->
+                                    importPreview = preview
+                                    showImportDialog = false
+                                    showImportPreviewDialog = true
+                                }.onFailure { error ->
+                                    scope.launch { snackbarHostState.showSnackbar("Invalid library JSON: ${error.message ?: "format error"}") }
                                 }
-                                showImportDialog = false
                             }
                         }
                     },
-                    enabled = importJsonInput.isNotBlank()
+                    enabled = importJsonInput.isNotBlank() && !isImportPreviewLoading
                 ) {
-                    Text("Import")
+                    Text(if (isImportPreviewLoading) "Checking…" else "Preview Import")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showImportDialog = false }) {
-                    Text("Cancel")
+                TextButton(onClick = { showImportDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    importPreview?.takeIf { showImportPreviewDialog }?.let { preview ->
+        AlertDialog(
+            onDismissRequest = { showImportPreviewDialog = false },
+            title = { Text("Import preview") },
+            text = {
+                Column {
+                    Text("${preview.importableCount} new series and ${preview.chapterCount} chapter records are ready to import.")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("${preview.duplicateCount} duplicates will be skipped. Existing entries will not be overwritten or deleted.", color = TextSecondary, fontSize = 12.sp)
+                    if (preview.invalidEntries.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("${preview.invalidEntries.size} malformed entries will be skipped:", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                        preview.invalidEntries.take(3).forEach { error ->
+                            Text(error, color = TextSecondary, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("No website page content or private/browser history is included.", color = TextSecondary, fontSize = 11.sp)
                 }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        viewModel.applyLibraryImport(preview) { result ->
+                            result.onFailure { error ->
+                                scope.launch { snackbarHostState.showSnackbar("Import failed: ${error.message ?: "database error"}") }
+                            }
+                            showImportPreviewDialog = false
+                            importPreview = null
+                        }
+                    },
+                    enabled = preview.importableCount > 0
+                ) { Text("Import ${preview.importableCount}") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showImportPreviewDialog = false; importPreview = null }) { Text("Cancel") }
             }
         )
     }
@@ -887,9 +968,10 @@ fun AddSeriesDialog(
     var sourceUrl by remember { mutableStateOf("") }
     var coverUrl by remember { mutableStateOf("") }
     var readingStatus by remember { mutableStateOf("READING") }
-    var ratingText by remember { mutableStateOf("4.5") }
+    var ratingText by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
-    var chapterCountText by remember { mutableStateOf("10") }
+    var chapterCountText by remember { mutableStateOf("") }
+    var chapterCountError by remember { mutableStateOf<String?>(null) }
     val statuses = listOf("READING", "PLAN_TO_READ", "COMPLETED", "ON_HOLD", "DROPPED")
 
     AlertDialog(
@@ -933,11 +1015,14 @@ fun AddSeriesDialog(
                 )
                 OutlinedTextField(
                     value = chapterCountText,
-                    onValueChange = { chapterCountText = it },
-                    label = { Text("Initial Chapters Detected") },
+                    onValueChange = { chapterCountText = it; chapterCountError = null },
+                    label = { Text("Known total chapters (optional)") },
+                    placeholder = { Text("Leave blank if unknown") },
                     singleLine = true,
+                    isError = chapterCountError != null,
                     modifier = Modifier.fillMaxWidth()
                 )
+                chapterCountError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 11.sp) }
                 OutlinedTextField(
                     value = ratingText,
                     onValueChange = { ratingText = it },
@@ -969,18 +1054,22 @@ fun AddSeriesDialog(
             Button(
                 onClick = {
                     if (title.isNotBlank() && sourceUrl.isNotBlank()) {
-                        val rating = ratingText.toFloatOrNull()
-                        val count = chapterCountText.toIntOrNull() ?: 1
-                        onConfirm(
-                            title.trim(),
-                            altTitles.trim().ifBlank { null },
-                            sourceUrl.trim(),
-                            coverUrl.trim().ifBlank { null },
-                            readingStatus,
-                            rating,
-                            description.trim().ifBlank { null },
-                            count
-                        )
+                        val count = if (chapterCountText.isBlank()) 0 else chapterCountText.toIntOrNull()
+                        if (count == null || count !in 0..100_000) {
+                            chapterCountError = "Enter a non-negative whole number, or leave the count blank."
+                        } else {
+                            val rating = ratingText.toFloatOrNull()
+                            onConfirm(
+                                title.trim(),
+                                altTitles.trim().ifBlank { null },
+                                sourceUrl.trim(),
+                                coverUrl.trim().ifBlank { null },
+                                readingStatus,
+                                rating,
+                                description.trim().ifBlank { null },
+                                count
+                            )
+                        }
                     }
                 },
                 enabled = title.isNotBlank() && sourceUrl.isNotBlank()
@@ -1111,4 +1200,31 @@ fun EditSeriesDialog(
             }
         }
     )
+}
+
+private const val MAX_LIBRARY_IMPORT_BYTES = 8 * 1024 * 1024
+
+private fun readUtf8Limited(context: Context, uri: Uri): String {
+    val input = context.contentResolver.openInputStream(uri)
+        ?: throw IllegalArgumentException("The selected file could not be opened")
+    val output = java.io.ByteArrayOutputStream()
+    input.use { stream ->
+        val buffer = ByteArray(8 * 1024)
+        var total = 0
+        while (true) {
+            val count = stream.read(buffer)
+            if (count < 0) break
+            total += count
+            if (total > MAX_LIBRARY_IMPORT_BYTES) {
+                throw IllegalArgumentException("File is larger than the 8 MiB import limit")
+            }
+            output.write(buffer, 0, count)
+        }
+    }
+    val decoded = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+        .decode(java.nio.ByteBuffer.wrap(output.toByteArray()))
+        .toString()
+    return decoded.removePrefix("\uFEFF")
 }

@@ -2,6 +2,7 @@ package com.example.ui.screens.browser
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Bundle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.MangaFlowApp
@@ -10,6 +11,9 @@ import com.example.domain.model.BrowserTab
 import com.example.domain.model.DetectedManhwa
 import com.example.domain.model.OcrBox
 import com.example.engine.browser.BrowserSessionManager
+import com.example.engine.browser.BrowserPreferences
+import com.example.engine.browser.ReaderArticle
+import com.example.engine.browser.ReaderExtractionResult
 import com.example.engine.browser.SearchEngine
 import com.example.engine.browser.UrlParser
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,6 +21,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -29,6 +34,7 @@ class BrowserViewModel : ViewModel() {
     private val ocrEngine = app.ocrTranslationEngine
     private val browserRepo = app.browserRepository
     private val manhwaRepo = app.manhwaRepository
+    private val trackerService = app.trackerService
 
     val normalTabs = sessionManager.normalTabs
     val privateTabs = sessionManager.privateTabs
@@ -39,6 +45,8 @@ class BrowserViewModel : ViewModel() {
     val disabledSites = filterEngine.disabledSites
     val detectedManhwa = trackerBridge.currentDetectedManhwa
     val canRestoreTab = sessionManager.canRestoreTab
+    val privateSessionGeneration = sessionManager.privateSessionGeneration
+    val browserPreferences = app.browserSettingsStore.settings
 
     private val _searchEngine = MutableStateFlow(SearchEngine.DUCKDUCKGO)
     val searchEngine: StateFlow<SearchEngine> = _searchEngine.asStateFlow()
@@ -74,9 +82,23 @@ class BrowserViewModel : ViewModel() {
     private val _findTotalMatches = MutableStateFlow(0)
     val findTotalMatches: StateFlow<Int> = _findTotalMatches.asStateFlow()
 
-    // Download notification status
     private val _downloadStatus = MutableStateFlow<String?>(null)
     val downloadStatus: StateFlow<String?> = _downloadStatus.asStateFlow()
+
+    private val _readerArticle = MutableStateFlow<ReaderArticle?>(null)
+    val readerArticle: StateFlow<ReaderArticle?> = _readerArticle.asStateFlow()
+
+    private val _readerError = MutableStateFlow<String?>(null)
+    val readerError: StateFlow<String?> = _readerError.asStateFlow()
+
+    private val _detectedSeriesMatch = MutableStateFlow<com.example.data.local.entity.SeriesEntity?>(null)
+    val detectedSeriesMatch: StateFlow<com.example.data.local.entity.SeriesEntity?> = _detectedSeriesMatch.asStateFlow()
+
+    private val _detectedUnreadCount = MutableStateFlow(0)
+    val detectedUnreadCount: StateFlow<Int> = _detectedUnreadCount.asStateFlow()
+
+    private val _webViewGeneration = MutableStateFlow(0)
+    val webViewGeneration: StateFlow<Int> = _webViewGeneration.asStateFlow()
 
     // OCR State
     private val _isOcrActive = MutableStateFlow(false)
@@ -126,29 +148,31 @@ class BrowserViewModel : ViewModel() {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     init {
-        // Load default search engine from settings
         viewModelScope.launch {
-            try {
-                val savedEngine = app.database.appSettingDao().getSetting("DEFAULT_SEARCH_ENGINE")
-                if (savedEngine != null) {
-                    _searchEngine.value = SearchEngine.fromDisplayName(savedEngine)
+            app.browserSettingsStore.settings.collectLatest { settings ->
+                _searchEngine.value = SearchEngine.fromDisplayName(settings.searchEngine)
+                sessionManager.updateBrowserDefaults(settings.homepage, settings.desktopSiteByDefault)
+            }
+        }
+        viewModelScope.launch {
+            detectedManhwa.collectLatest { detected ->
+                if (detected == null || isPrivateMode.value) {
+                    _detectedSeriesMatch.value = null
+                    _detectedUnreadCount.value = 0
+                } else {
+                    val match = try { trackerService.findMatchingSeries(detected) } catch (_: Exception) { null }
+                    _detectedSeriesMatch.value = match
+                    _detectedUnreadCount.value = if (match == null) 0 else try {
+                        trackerService.getChaptersForSeriesSync(match.id).count { !it.isRead }
+                    } catch (_: Exception) { 0 }
                 }
-            } catch (_: Exception) {
-                // Test environment fallback
             }
         }
     }
 
     fun setSearchEngine(engine: SearchEngine) {
         _searchEngine.value = engine
-        viewModelScope.launch {
-            app.database.appSettingDao().setSetting(
-                com.example.data.local.entity.AppSettingEntity(
-                    key = "DEFAULT_SEARCH_ENGINE",
-                    value = engine.displayName
-                )
-            )
-        }
+        app.browserSettingsStore.setSearchEngine(engine.displayName)
     }
 
     fun onAddressInputChanged(newText: String) {
@@ -165,7 +189,17 @@ class BrowserViewModel : ViewModel() {
         _isEditingAddress.value = false
     }
 
-    fun submitAddress(urlOrQuery: String) {
+    fun openNormalAddress(urlOrQuery: String): String {
+        val current = sessionManager.getCurrentTab()
+        if (current?.isPrivate == true) {
+            val normalTab = sessionManager.normalTabs.value.firstOrNull()
+            if (normalTab != null) sessionManager.switchTab(normalTab.id)
+            else sessionManager.openNewTab(isPrivate = false)
+        }
+        return submitAddress(urlOrQuery)
+    }
+
+    fun submitAddress(urlOrQuery: String): String {
         _isEditingAddress.value = false
         _isPageTranslated.value = false
         _pageTranslationError.value = null
@@ -180,6 +214,7 @@ class BrowserViewModel : ViewModel() {
                 isCrashed = false
             )
         }
+        return finalUrl
     }
 
     fun loadUrl(url: String) {
@@ -213,21 +248,38 @@ class BrowserViewModel : ViewModel() {
         sessionManager.toggleDesktopMode(tab.id)
     }
 
-    fun openNewTab(url: String = BrowserSessionManager.DEFAULT_HOME_URL, isPrivate: Boolean = isPrivateMode.value) {
-        sessionManager.openNewTab(url, isPrivate)
+    fun openNewTab(url: String? = null, isPrivate: Boolean = isPrivateMode.value): BrowserTab? {
+        val tab = sessionManager.openNewTab(url ?: browserPreferences.value.homepage, isPrivate)
         _showTabSwitcher.value = false
+        return tab
     }
+
+    fun saveWebViewState(tabId: String, state: Bundle) = sessionManager.saveWebViewState(tabId, state)
+
+    fun getWebViewState(tabId: String): Bundle? = sessionManager.getWebViewState(tabId)
+
+    fun onPrivateWebViewCreated(profileName: String) = sessionManager.onPrivateWebViewCreated(profileName)
+
+    fun shouldPurgePrivateProfile(profileName: String): Boolean = sessionManager.shouldPurgePrivateProfile(profileName)
+
+    fun onBrowserWebViewReleased(privateProfileName: String?) =
+        sessionManager.onBrowserWebViewReleased(privateProfileName)
 
     fun switchTab(tabId: String) {
         sessionManager.switchTab(tabId)
         _showTabSwitcher.value = false
         closeFindInPage()
+        closeReaderMode()
         _isPageTranslated.value = false
         _pageTranslationError.value = null
     }
 
     fun closeTab(tabId: String, context: Context) {
+        val wasPrivate = sessionManager.privateTabs.value.any { it.id == tabId }
         sessionManager.closeTab(tabId, context)
+        if (wasPrivate && sessionManager.privateTabs.value.isEmpty()) {
+            app.browserDownloadManager.clearPrivateSessionMetadata()
+        }
     }
 
     fun restoreLastClosedTab() {
@@ -236,6 +288,7 @@ class BrowserViewModel : ViewModel() {
 
     fun closeAllPrivateTabs(context: Context) {
         sessionManager.closeAllPrivateTabs(context)
+        app.browserDownloadManager.clearPrivateSessionMetadata()
     }
 
     fun togglePrivateMode(isPrivate: Boolean) {
@@ -295,6 +348,7 @@ class BrowserViewModel : ViewModel() {
     fun handleRendererCrash() {
         val tab = currentTab.value ?: return
         sessionManager.handleRendererCrash(tab.id)
+        _webViewGeneration.value += 1
     }
 
     fun setTabError(errorMessage: String) {
@@ -302,10 +356,29 @@ class BrowserViewModel : ViewModel() {
         sessionManager.setTabError(tab.id, errorMessage)
     }
 
-    fun toggleReaderMode() {
-        val current = currentTab.value ?: return
-        val newState = !current.isReaderModeActive
-        sessionManager.updateCurrentTab { it.copy(isReaderModeActive = newState) }
+    fun setReaderExtractionResult(result: ReaderExtractionResult) {
+        when (result) {
+            is ReaderExtractionResult.Success -> {
+                _readerError.value = null
+                _readerArticle.value = result.article
+                sessionManager.updateCurrentTab { it.copy(isReaderModeActive = true) }
+            }
+            is ReaderExtractionResult.Failure -> {
+                _readerArticle.value = null
+                _readerError.value = result.reason
+                sessionManager.updateCurrentTab { it.copy(isReaderModeActive = false) }
+            }
+        }
+    }
+
+    fun closeReaderMode() {
+        _readerArticle.value = null
+        _readerError.value = null
+        sessionManager.updateCurrentTab { it.copy(isReaderModeActive = false) }
+    }
+
+    fun dismissReaderError() {
+        _readerError.value = null
     }
 
     fun runOcrOnSnapshot(bitmap: Bitmap?) {
@@ -413,18 +486,36 @@ class BrowserViewModel : ViewModel() {
     }
 
     fun saveDetectedToLibrary(detected: DetectedManhwa) {
+        if (isPrivateMode.value) return
         viewModelScope.launch {
             manhwaRepo.addManhwa(
                 SeriesEntity(
                     title = detected.title,
                     sourceUrl = detected.sourceUrl,
-                    currentChapterNum = detected.chapterNumber,
-                    totalChapters = detected.chapterNumber.toInt().coerceAtLeast(10),
+                    currentChapterNum = 0f,
+                    latestChapterIdentifier = detected.chapterIdentifier,
+                    lastReadChapterIdentifier = "0",
+                    totalChapters = 0,
                     readingStatus = "READING",
-                    lastReadTimestamp = System.currentTimeMillis()
+                    lastReadTimestamp = 0L
                 )
             )
-            trackerBridge.clearDetection()
+            val match = trackerService.findMatchingSeries(detected)
+            _detectedSeriesMatch.value = match
+            _detectedUnreadCount.value = match?.let { trackerService.getChaptersForSeriesSync(it.id).count { chapter -> !chapter.isRead } } ?: 0
+        }
+    }
+
+    fun confirmDetectedChapterRead(detected: DetectedManhwa) {
+        if (isPrivateMode.value) return
+        val series = _detectedSeriesMatch.value ?: return
+        viewModelScope.launch {
+            try {
+                trackerService.markDetectedChapterRead(series.id, detected)
+                trackerBridge.clearDetection()
+            } catch (e: Exception) {
+                _downloadStatus.value = "Progress was not updated: ${e.message ?: "Please try again"}"
+            }
         }
     }
 

@@ -41,6 +41,7 @@ import androidx.compose.material3.TabRowDefaults
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,6 +52,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.MangaFlowApp
 import com.example.domain.model.BrowserTab
 import com.example.ui.theme.MangaAmethyst
 import com.example.ui.theme.MangaPrimary
@@ -74,6 +76,10 @@ fun TabSwitcherView(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val privateNotice = remember {
+        try { MangaFlowApp.instance.privacyManager.getPrivacyNotice() }
+        catch (_: Exception) { "Private tabs do not save MangaFlow history or reading progress, but may not isolate all site storage on older WebView versions. Downloaded files and Android's download record can remain after the session ends." }
+    }
     val activeList = if (isPrivateActive) privateTabs else normalTabs
 
     Box(
@@ -192,7 +198,7 @@ fun TabSwitcherView(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Isolated Private Session",
+                                text = "Private Browsing",
                                 color = MangaAmethyst,
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 14.sp
@@ -200,7 +206,7 @@ fun TabSwitcherView(
                         }
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "History, search queries, cookies, and reading statistics are not saved. Ephemeral session state and cookies are purged when private tabs close. Note: Private browsing does not provide network anonymity or conceal your activity from internet service providers, network administrators, or visited websites.",
+                            text = privateNotice,
                             color = TextSecondary,
                             fontSize = 11.sp,
                             lineHeight = 15.sp
@@ -215,7 +221,7 @@ fun TabSwitcherView(
                             ) {
                                 Icon(imageVector = Icons.Default.DeleteSweep, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Close All & Wipe Ephemeral Data", fontSize = 12.sp)
+                                Text("Close All Private Tabs", fontSize = 12.sp)
                             }
                         }
                     }

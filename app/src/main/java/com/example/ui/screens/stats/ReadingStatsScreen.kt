@@ -258,7 +258,7 @@ fun ReadingStatsScreen(
                     verticalAlignment = Alignment.Bottom
                 ) {
                     for (item in summary.dailyList) {
-                        val barHeightPercent = (item.minutes.toFloat() / maxMinutes).coerceIn(0.08f, 1f)
+                        val barHeightPercent = if (item.minutes <= 0) 0f else (item.minutes.toFloat() / maxMinutes).coerceIn(0.08f, 1f)
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             modifier = Modifier.weight(1f)

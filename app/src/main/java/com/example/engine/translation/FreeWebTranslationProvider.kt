@@ -86,10 +86,11 @@ class FreeWebTranslationProvider(
                     )
                 )
             }
-        } catch (e: IOException) {
-            TranslationResult.Error("Network failure during web translation: ${e.message}", e)
-        } catch (e: Exception) {
-            TranslationResult.Error("Parsing failure: ${e.message}", e)
+        } catch (_: IOException) {
+            // Do not surface the failed request URL; it contains the text being translated.
+            TranslationResult.Error("Network failure during web translation")
+        } catch (_: Exception) {
+            TranslationResult.Error("The translation provider returned an unreadable response")
         }
     }
 }

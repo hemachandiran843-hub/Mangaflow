@@ -56,7 +56,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -71,6 +73,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.MangaFlowApp
@@ -83,6 +88,24 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import kotlinx.coroutines.launch
 
+private fun sourceStatusLabel(status: String, automatic: Boolean): String = when {
+    !automatic -> "Manual tracking only"
+    status == "NOT_CHECKED" -> "Available; not checked yet"
+    status == "SUCCESS" -> "Listing fetch succeeded"
+    status == "NO_NEW_CHAPTERS" -> "Checked; no new chapters"
+    status == "NETWORK_ERROR" -> "Network error"
+    status == "SOURCE_UNAVAILABLE" -> "Source unavailable"
+    status == "RATE_LIMITED" -> "Rate limited"
+    status == "PARSING_ERROR" -> "Listing format not recognized"
+    status == "UNSUPPORTED" -> "Unsupported URL"
+    status == "METADATA_OK" -> "Metadata available; no release check yet"
+    else -> status.replace('_', ' ').lowercase().replaceFirstChar(Char::uppercase)
+}
+
+private fun formatSourceTimestamp(timestamp: Long?): String = timestamp?.let {
+    java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it))
+} ?: "Never"
+
 @Composable
 fun SettingsScreen(
     viewModel: SettingsViewModel,
@@ -94,9 +117,9 @@ fun SettingsScreen(
     val scrollState = rememberScrollState()
 
     val themeState by viewModel.themeState.collectAsState()
-    val searchEngine by viewModel.searchEngine.collectAsState()
-    val desktopSite by viewModel.desktopSitePreference.collectAsState()
-    val privateBrowsing by viewModel.privateBrowsingEnabled.collectAsState()
+    val browserPreferences by viewModel.browserPreferences.collectAsState()
+    val searchEngine = browserPreferences.searchEngine
+    val desktopSite = browserPreferences.desktopSiteByDefault
     val adBlocker by viewModel.adBlockerEnabled.collectAsState()
     val trackerBlocker by viewModel.trackerBlockerEnabled.collectAsState()
     val cosmeticFiltering by viewModel.cosmeticFilteringEnabled.collectAsState()
@@ -115,18 +138,17 @@ fun SettingsScreen(
     val cachedTranslationsCount by viewModel.cachedTranslationsCount.collectAsState()
     val customEndpoint by viewModel.customEndpoint.collectAsState()
     val customApiKey by viewModel.customApiKey.collectAsState()
+    val credentialWarning by viewModel.credentialWarning.collectAsState()
 
-    val readerMode by viewModel.readerMode.collectAsState()
-    val autoTracking by viewModel.autoProgressTracking.collectAsState()
     val newChapterAlerts by viewModel.newChapterNotifications.collectAsState()
     val chapterMonitoringEnabled by viewModel.chapterMonitoringEnabled.collectAsState()
     val monitoringIntervalHours by viewModel.monitoringIntervalHours.collectAsState()
+    val sourceManagement by viewModel.sourceManagement.collectAsState()
 
     var showSearchEngineMenu by remember { mutableStateOf(false) }
     var showLanguageMenu by remember { mutableStateOf(false) }
     var showProviderMenu by remember { mutableStateOf(false) }
     var showSourceLangMenu by remember { mutableStateOf(false) }
-    var showReaderModeMenu by remember { mutableStateOf(false) }
     var showDensityMenu by remember { mutableStateOf(false) }
     var showIntervalMenu by remember { mutableStateOf(false) }
     var showAllowlistDialog by remember { mutableStateOf(false) }
@@ -134,6 +156,9 @@ fun SettingsScreen(
     var newAllowlistInput by remember { mutableStateOf("") }
     var editEndpoint by remember(customEndpoint) { mutableStateOf(customEndpoint) }
     var editApiKey by remember(customApiKey) { mutableStateOf(customApiKey) }
+    var homepageDraft by remember(browserPreferences.homepage) { mutableStateOf(browserPreferences.homepage) }
+    var homepageError by remember { mutableStateOf<String?>(null) }
+    var showClearBrowsingDataConfirm by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -270,6 +295,30 @@ fun SettingsScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
+                Text("Homepage", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = homepageDraft,
+                    onValueChange = { homepageDraft = it; homepageError = null },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("HTTP or HTTPS URL") },
+                    isError = homepageError != null
+                )
+                homepageError?.let { Text(it, color = MangaAdShield, fontSize = 11.sp) }
+                Button(
+                    onClick = {
+                        if (viewModel.setDefaultHomepage(homepageDraft)) {
+                            homepageError = null
+                            Toast.makeText(context, "Homepage saved", Toast.LENGTH_SHORT).show()
+                        } else homepageError = "Enter a valid HTTP or HTTPS homepage URL."
+                    },
+                    modifier = Modifier.align(Alignment.End),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) { Text("Save Homepage") }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
                 // Search engine dropdown
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -315,8 +364,8 @@ fun SettingsScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Request Desktop Site", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Send desktop User-Agent to websites (Phase 3 Engine)", color = TextSecondary, fontSize = 11.sp)
+                        Text("Desktop site by default", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text("New tabs request a desktop layout", color = TextSecondary, fontSize = 11.sp)
                     }
                     Switch(
                         checked = desktopSite,
@@ -324,6 +373,39 @@ fun SettingsScreen(
                         colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary)
                     )
                 }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Browser text scale: ${browserPreferences.textZoomPercent}%", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Slider(
+                    value = browserPreferences.textZoomPercent.toFloat(),
+                    onValueChange = { viewModel.setTextZoomPercent(it.toInt()) },
+                    valueRange = 75f..200f
+                )
+
+                PreferenceToggleRow(
+                    title = "Accept website cookies",
+                    subtitle = "Cookies can keep you signed in; normal and supported private profiles are controlled separately.",
+                    checked = browserPreferences.acceptCookies,
+                    onCheckedChange = viewModel::setAcceptCookies
+                )
+                PreferenceToggleRow(
+                    title = "Allow third-party cookies",
+                    subtitle = "Disabled by default to reduce cross-site tracking.",
+                    checked = browserPreferences.acceptThirdPartyCookies,
+                    onCheckedChange = viewModel::setAcceptThirdPartyCookies
+                )
+                PreferenceToggleRow(
+                    title = "Allow website permission prompts",
+                    subtitle = "Sites may ask for camera, microphone or location; each request still requires your confirmation and Android permission.",
+                    checked = browserPreferences.allowWebsitePermissionPrompts,
+                    onCheckedChange = viewModel::setWebsitePermissionPrompts
+                )
+                PreferenceToggleRow(
+                    title = "Open external links",
+                    subtitle = "Allow supported mail, phone and app links to open outside MangaFlow.",
+                    checked = browserPreferences.openExternalLinks,
+                    onCheckedChange = viewModel::setOpenExternalLinks
+                )
             }
         }
 
@@ -337,51 +419,21 @@ fun SettingsScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
-                // Clear browsing history
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Browsing History", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Manage and clear locally saved page history", color = TextSecondary, fontSize = 11.sp)
+                        Text("Clear browsing data", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Clears saved history, cookies, cache, site storage and location permission decisions. Downloaded files and your library are kept.", color = TextSecondary, fontSize = 11.sp)
                     }
                     Button(
-                        onClick = {
-                            scope.launch {
-                                app.browserRepository.clearHistory()
-                                Toast.makeText(context, "Browsing history cleared", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surface),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text("Clear History", color = TextPrimary, fontSize = 11.sp)
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Purge Cookies & Cache
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Cookies & Ephemeral Storage", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Purges session cookies and WebView cache", color = TextSecondary, fontSize = 11.sp)
-                    }
-                    Button(
-                        onClick = {
-                            app.privacyManager.purgePrivateData(context)
-                            Toast.makeText(context, "Cache and cookies purged", Toast.LENGTH_SHORT).show()
-                        },
+                        onClick = { showClearBrowsingDataConfirm = true },
                         colors = ButtonDefaults.buttonColors(containerColor = MangaAmethyst.copy(alpha = 0.2f)),
                         shape = RoundedCornerShape(8.dp)
                     ) {
-                        Text("Purge Cache", color = MangaAmethyst, fontSize = 11.sp)
+                        Text("Clear Data", color = MangaAmethyst, fontSize = 11.sp)
                     }
                 }
 
@@ -394,7 +446,7 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "Notice: Private browsing isolates history, search queries, cookies, and reading statistics on this device. It does not provide network anonymity or conceal your activity from internet service providers, network administrators, or visited websites.",
+                        text = app.privacyManager.getPrivacyNotice(),
                         color = TextSecondary,
                         fontSize = 11.sp,
                         lineHeight = 15.sp,
@@ -750,9 +802,10 @@ fun SettingsScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Allow Cloud Translation", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Permits transmitting non-private text to external translation APIs. Private browsing strictly enforces zero cloud transmission.",
+                            "Permits transmitting non-private text to external translation APIs. Public translation may place text in an HTTPS request URL that the provider can log; custom APIs receive the text and configured key. Review the selected provider's privacy policy. Private browsing strictly blocks cloud translation.",
                             color = TextSecondary,
-                            fontSize = 11.sp
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
                         )
                     }
                     Switch(
@@ -809,9 +862,10 @@ fun SettingsScreen(
                     OutlinedTextField(
                         value = editEndpoint,
                         onValueChange = { editEndpoint = it },
-                        label = { Text("API Endpoint URL") },
+                        label = { Text("API Endpoint URL (HTTPS; HTTP only for localhost)") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     OutlinedTextField(
@@ -819,13 +873,22 @@ fun SettingsScreen(
                         onValueChange = { editApiKey = it },
                         label = { Text("API Key (optional)") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
                     )
+                    credentialWarning?.let {
+                        Text(it, color = MaterialTheme.colorScheme.error, fontSize = 11.sp)
+                    }
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
                         onClick = {
-                            viewModel.saveCustomApiCredentials(editEndpoint, editApiKey)
-                            Toast.makeText(context, "Custom API credentials saved", Toast.LENGTH_SHORT).show()
+                            val saved = viewModel.saveCustomApiCredentials(editEndpoint, editApiKey)
+                            Toast.makeText(
+                                context,
+                                if (saved) "Custom API credentials saved securely" else "Could not save. Use HTTPS (HTTP only for localhost) and check secure storage.",
+                                Toast.LENGTH_LONG
+                            ).show()
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         shape = RoundedCornerShape(8.dp)
@@ -846,60 +909,11 @@ fun SettingsScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
-                // Reader Mode layout
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text("Default Reader Mode", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text(readerMode, color = TextSecondary, fontSize = 11.sp)
-                    }
-                    Box {
-                        Surface(
-                            color = MaterialTheme.colorScheme.surface,
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier.clickable { showReaderModeMenu = true }
-                        ) {
-                            Text(readerMode, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
-                        }
-                        DropdownMenu(
-                            expanded = showReaderModeMenu,
-                            onDismissRequest = { showReaderModeMenu = false },
-                            modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant)
-                        ) {
-                            listOf("Vertical Strip", "Webtoon", "Single Page").forEach { mode ->
-                                DropdownMenuItem(
-                                    text = { Text(mode, color = TextPrimary) },
-                                    onClick = {
-                                        viewModel.setReaderMode(mode)
-                                        showReaderModeMenu = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
+                Text("Reader Mode", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Extracts readable text into a native view with adjustable font size, line spacing, colors and width. The original webpage stays untouched and can be restored instantly.", color = TextSecondary, fontSize = 11.sp, lineHeight = 15.sp)
                 Spacer(modifier = Modifier.height(12.dp))
-
-                // Auto Progress Tracking
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Auto Progress Tracking", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Automatically records chapter number when reading", color = TextSecondary, fontSize = 11.sp)
-                    }
-                    Switch(
-                        checked = autoTracking,
-                        onCheckedChange = viewModel::setAutoProgressTracking,
-                        colors = SwitchDefaults.colors(checkedThumbColor = MangaSecondary)
-                    )
-                }
+                Text("Reading progress", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text("Chapter detection is a suggestion only. MangaFlow changes library progress only after you confirm it; private tabs never update normal reading progress.", color = TextSecondary, fontSize = 11.sp, lineHeight = 15.sp)
             }
         }
 
@@ -984,7 +998,12 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("System Release Alerts", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Status bar notifications when new chapters release", color = TextSecondary, fontSize = 11.sp)
+                        Text(
+                            "Notifications show tracked series and chapter titles; Android may keep them in its notification history. Private browsing does not create chapter alerts.",
+                            color = TextSecondary,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        )
                     }
                     Switch(
                         checked = newChapterAlerts,
@@ -1020,6 +1039,69 @@ fun SettingsScreen(
                 ) {
                     Text("Cloud Monitoring & FCM Push (Optional)", color = TextSecondary, fontSize = 11.sp)
                     Text("Learn More", color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(18.dp))
+        SettingsCategoryHeader("Source Management", Icons.Default.Public)
+        Card(
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    "Automatic release checks use only sources with an implemented public listing or official API. Other pages stay browsable and support manual progress.",
+                    color = TextSecondary,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                if (sourceManagement.isEmpty()) {
+                    Text("Source status is loading.", color = TextSecondary, fontSize = 12.sp)
+                } else {
+                    sourceManagement.forEachIndexed { index, source ->
+                        if (index > 0) Spacer(modifier = Modifier.height(12.dp))
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(source.displayName, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (source.automaticTrackingAvailable) "AUTO" else "MANUAL",
+                                    color = if (source.automaticTrackingAvailable) MangaSecondary else TextSecondary,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            Text(
+                                "Status: ${sourceStatusLabel(source.status, source.automaticTrackingAvailable)} • ${source.trackedSeriesCount} tracked",
+                                color = TextSecondary,
+                                fontSize = 10.sp
+                            )
+                            Text(
+                                "Last check: ${formatSourceTimestamp(source.lastCheckedAt)} • last success: ${formatSourceTimestamp(source.lastSuccessAt)}",
+                                color = TextSecondary,
+                                fontSize = 10.sp
+                            )
+                            Text(
+                                "Metadata lookup: ${if (source.supportsMetadataLookup) "available" else "unavailable"}",
+                                color = TextSecondary,
+                                fontSize = 10.sp
+                            )
+                            source.lastError?.takeIf(String::isNotBlank)?.let { detail ->
+                                Text(
+                                    "Last reported issue: $detail",
+                                    color = if (source.automaticTrackingAvailable) MaterialTheme.colorScheme.error else TextSecondary,
+                                    fontSize = 10.sp,
+                                    lineHeight = 14.sp
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1122,6 +1204,57 @@ fun SettingsScreen(
         }
 
         Spacer(modifier = Modifier.height(32.dp))
+    }
+
+    if (showClearBrowsingDataConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearBrowsingDataConfirm = false },
+            title = { Text("Clear browsing data?") },
+            text = {
+                Text("This clears browser history, cookies, cached site data and site permission decisions. Open private tabs will be closed. Downloaded files and library progress will not be deleted.")
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showClearBrowsingDataConfirm = false
+                    viewModel.clearBrowsingData { success ->
+                        Toast.makeText(
+                            context,
+                            if (success) "Browsing data cleared; downloaded files were kept." else "Some browsing data could not be cleared.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }) { Text("Clear") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearBrowsingDataConfirm = false }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PreferenceToggleRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(subtitle, color = TextSecondary, fontSize = 10.sp, lineHeight = 13.sp)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary)
+        )
     }
 }
 

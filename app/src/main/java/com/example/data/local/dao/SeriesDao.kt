@@ -59,6 +59,9 @@ interface SeriesDao {
     @Query("UPDATE series SET lastReadChapterIdentifier = :chapterIdentifier, currentChapterNum = :chapterNum, lastReadTimestamp = :timestamp, lastUpdated = :timestamp WHERE id = :id")
     suspend fun updateLastReadChapter(id: Long, chapterIdentifier: String, chapterNum: Float, timestamp: Long)
 
+    @Query("UPDATE series SET lastReadChapterIdentifier = :chapterIdentifier, lastReadTimestamp = :timestamp, lastUpdated = :timestamp WHERE id = :id")
+    suspend fun updateLastReadChapterIdentifierOnly(id: Long, chapterIdentifier: String, timestamp: Long)
+
     @Query("UPDATE series SET hasUnreadNewChapter = 1, latestChapterIdentifier = :chapterNum, lastUpdated = :timestamp WHERE id = :id")
     suspend fun setNewChapterDetected(id: Long, chapterNum: Float, timestamp: Long = System.currentTimeMillis())
 

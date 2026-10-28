@@ -17,6 +17,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.CollectionsBookmark
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Translate
@@ -60,6 +61,7 @@ fun BrowserBottomBar(
     onTriggerOcrTranslation: () -> Unit,
     onOpenBookmarks: () -> Unit,
     onOpenHistory: () -> Unit,
+    onOpenDownloads: () -> Unit = {},
     onTogglePrivate: () -> Unit,
     onBookmarkCurrentPage: () -> Unit,
     onToggleDesktopMode: () -> Unit = {},
@@ -223,6 +225,17 @@ fun BrowserBottomBar(
                         onClick = {
                             showMenu = false
                             onTriggerOcrTranslation()
+                        }
+                    )
+
+                    DropdownMenuItem(
+                        text = { Text("Downloads", color = TextPrimary) },
+                        leadingIcon = {
+                            Icon(Icons.Default.Download, contentDescription = null, tint = MangaPrimary)
+                        },
+                        onClick = {
+                            showMenu = false
+                            onOpenDownloads()
                         }
                     )
 

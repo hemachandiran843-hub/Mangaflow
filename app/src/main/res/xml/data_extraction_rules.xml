@@ -1,19 +1,15 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
--->
+<?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <!-- Do not copy the WebView profile store: it can contain cookies and site storage. -->
+        <exclude domain="root" path="app_webview/" />
+        <exclude domain="file" path="app_webview/" />
+        <exclude domain="sharedpref" path="mangaflow_translation_credentials.xml" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <!-- A device migration must not carry private WebView profile contents forward. -->
+        <exclude domain="root" path="app_webview/" />
+        <exclude domain="file" path="app_webview/" />
+        <exclude domain="sharedpref" path="mangaflow_translation_credentials.xml" />
     </device-transfer>
-    -->
 </data-extraction-rules>

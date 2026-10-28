@@ -5,18 +5,25 @@ import com.example.data.local.dao.NotificationDao
 import com.example.data.local.dao.ReadingProgressDao
 import com.example.data.local.dao.ReadingSessionDao
 import com.example.data.local.dao.SeriesDao
+import com.example.data.local.MangaFlowDatabase
 import com.example.data.local.entity.ChapterEntity
 import com.example.data.local.entity.NotificationEntity
 import com.example.data.local.entity.ReadingProgressEntity
-import com.example.data.local.entity.ReadingSessionEntity
 import com.example.data.local.entity.SeriesEntity
+import com.example.domain.model.DetectedManhwa
+import com.example.engine.source.SourceManager
+import androidx.room.withTransaction
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import org.json.JSONArray
 import org.json.JSONObject
-import java.time.Instant
+import java.net.URI
+import java.text.Normalizer
+import java.util.Locale
 import java.time.LocalDate
-import java.time.temporal.ChronoUnit
+import java.time.ZoneId
 
 data class ReadingStatistics(
     val totalSeries: Int = 0,
@@ -32,13 +39,56 @@ data class ReadingStatistics(
     val totalHoursRead: Float = 0f
 )
 
+data class PortableLibraryChapter(
+    val identifier: String,
+    val number: Float?,
+    val title: String,
+    val url: String,
+    val isRead: Boolean,
+    val progressPercent: Float,
+    val lastReadAt: Long
+)
+
+data class PortableLibrarySeries(
+    val title: String,
+    val alternateTitles: String?,
+    val coverUrl: String?,
+    val sourceId: String,
+    val sourceName: String,
+    val sourceUrl: String,
+    val readingStatus: String,
+    val latestChapterIdentifier: String,
+    val lastReadChapterIdentifier: String,
+    val currentChapterNum: Float,
+    val totalChapters: Int,
+    val rating: Float?,
+    val notes: String,
+    val dateAdded: Long,
+    val lastReadTimestamp: Long,
+    val chapters: List<PortableLibraryChapter>
+)
+
+data class LibraryImportPreview(
+    val sourceVersion: Int,
+    val totalEntries: Int,
+    val importableSeries: List<PortableLibrarySeries>,
+    val duplicateCount: Int,
+    val invalidEntries: List<String>
+) {
+    val importableCount: Int get() = importableSeries.size
+    val chapterCount: Int get() = importableSeries.sumOf { it.chapters.size }
+}
+
 class ManhwaTrackerService(
     private val seriesDao: SeriesDao,
     private val chapterDao: ChapterDao,
     private val readingProgressDao: ReadingProgressDao,
     private val readingSessionDao: ReadingSessionDao,
-    private val notificationDao: NotificationDao
+    private val notificationDao: NotificationDao,
+    private val database: MangaFlowDatabase? = null,
+    private val sourceManager: SourceManager? = null
 ) {
+    private val importMutex = Mutex()
     val allSeries: Flow<List<SeriesEntity>> = seriesDao.getAllSeries()
 
     fun getSeriesByStatus(status: String): Flow<List<SeriesEntity>> =
@@ -56,9 +106,7 @@ class ManhwaTrackerService(
     suspend fun getChaptersForSeriesSync(seriesId: Long): List<ChapterEntity> =
         chapterDao.getChaptersForSeriesSync(seriesId)
 
-    /**
-     * 1. Add a series manually with validation
-     */
+    /** Add a library entry without inventing chapter rows or read progress. */
     suspend fun addSeriesManually(
         title: String,
         alternateTitles: String? = null,
@@ -67,12 +115,26 @@ class ManhwaTrackerService(
         readingStatus: String = "READING",
         rating: Float? = null,
         description: String? = null,
-        initialChapterCount: Int = 1
+        initialChapterCount: Int = 0,
+        sourceId: String = "manual",
+        sourceName: String = "Manual Entry"
     ): Long {
         require(title.isNotBlank()) { "Series title cannot be blank" }
-        require(sourceUrl.isNotBlank()) { "Source URL cannot be blank" }
+        require(isHttpUrl(sourceUrl)) { "Source URL must be an HTTP(S) URL" }
 
-        val existing = seriesDao.findBySourceUrl(sourceUrl) ?: seriesDao.findByTitle(title)
+        val matchedAdapter = sourceManager?.adapterForUrl(sourceUrl)
+        val selectedAdapter = matchedAdapter?.takeIf {
+            sourceId.equals("manual", ignoreCase = true) || it.sourceId.equals(sourceId, ignoreCase = true)
+        }
+        val effectiveSourceId = selectedAdapter?.sourceId ?: sourceId.takeIf { it.isNotBlank() } ?: "manual"
+        val effectiveSourceName = if (sourceName == "Manual Entry" && selectedAdapter != null) {
+            selectedAdapter.displayName
+        } else sourceName
+        val canonicalUrl = selectedAdapter?.canonicalizeSeriesUrl(sourceUrl)?.takeIf(::isHttpUrl) ?: sourceUrl.trim()
+        val canonicalKey = canonicalUrl(canonicalUrl, effectiveSourceId)
+        val existing = seriesDao.findBySourceUrl(sourceUrl)
+            ?: seriesDao.findBySourceUrl(canonicalUrl)
+            ?: seriesDao.getAllSeriesSync().firstOrNull { canonicalUrl(it.sourceUrl, it.sourceId) == canonicalKey }
         if (existing != null) {
             val updated = existing.copy(
                 alternateTitles = alternateTitles ?: existing.alternateTitles,
@@ -91,39 +153,21 @@ class ManhwaTrackerService(
             title = title.trim(),
             alternateTitles = alternateTitles?.trim(),
             coverUrl = coverUrl?.trim(),
-            sourceId = "manual",
-            sourceName = "Manual Entry",
-            sourceUrl = sourceUrl.trim(),
+            sourceId = effectiveSourceId,
+            sourceName = effectiveSourceName,
+            sourceUrl = canonicalUrl,
             readingStatus = readingStatus,
-            latestChapterIdentifier = initialChapterCount.toString(),
+            latestChapterIdentifier = "0",
             lastReadChapterIdentifier = "0",
             currentChapterNum = 0f,
-            totalChapters = initialChapterCount.coerceAtLeast(1),
+            totalChapters = initialChapterCount.coerceIn(0, MAX_KNOWN_CHAPTER_COUNT),
             rating = rating,
             description = description?.trim(),
             dateAdded = now,
-            lastReadTimestamp = now,
+            lastReadTimestamp = 0L,
             lastUpdated = now
         )
-
-        val seriesId = seriesDao.insert(newSeries)
-
-        // Seed initial chapters
-        for (i in 1..initialChapterCount) {
-            chapterDao.insert(
-                ChapterEntity(
-                    seriesId = seriesId,
-                    chapterNumber = i.toFloat(),
-                    chapterIdentifier = i.toString(),
-                    chapterTitle = "Chapter $i",
-                    chapterUrl = "$sourceUrl/chapter-$i",
-                    firstDetectedAt = now,
-                    isRead = false
-                )
-            )
-        }
-
-        return seriesId
+        return seriesDao.insert(newSeries)
     }
 
     /**
@@ -197,31 +241,29 @@ class ManhwaTrackerService(
         require(chapter.seriesId == seriesId) { "Chapter does not belong to series $seriesId" }
 
         val wasRead = chapter.isRead
+        if (wasRead == isRead) return
         val now = System.currentTimeMillis()
 
         chapterDao.setChapterReadState(chapterId, isRead, now)
 
-        if (isRead && !wasRead) {
+        if (isRead) {
             // Update series last read chapter
-            seriesDao.updateLastReadChapter(
-                id = seriesId,
-                chapterIdentifier = chapter.chapterIdentifier,
-                chapterNum = chapter.chapterNumber ?: 1f,
-                timestamp = now
-            )
-
-            // Log a reading session for stats tracking
-            readingSessionDao.insertSession(
-                ReadingSessionEntity(
-                    seriesId = seriesId,
-                    chapterId = chapterId,
-                    startTime = now - 300000L, // 5 min session
-                    endTime = now,
-                    durationSeconds = 300,
-                    chaptersReadCount = 1,
-                    dateEpochDay = LocalDate.now().toEpochDay()
+            if (chapter.chapterNumber != null) {
+                seriesDao.updateLastReadChapter(
+                    id = seriesId,
+                    chapterIdentifier = chapter.chapterIdentifier,
+                    chapterNum = chapter.chapterNumber,
+                    timestamp = now
                 )
-            )
+            } else {
+                seriesDao.updateLastReadChapterIdentifierOnly(
+                    id = seriesId,
+                    chapterIdentifier = chapter.chapterIdentifier,
+                    timestamp = now
+                )
+            }
+
+            // Explicit progress changes update chapter state only. No synthetic reading duration is recorded.
         }
     }
 
@@ -237,6 +279,9 @@ class ManhwaTrackerService(
         pageIndex: Int,
         totalPages: Int?
     ) {
+        require(pageIndex >= 0) { "Page index cannot be negative" }
+        require(totalPages == null || totalPages > 0) { "Total pages must be positive when provided" }
+        require(totalPages == null || pageIndex < totalPages) { "Page index must be less than the page count" }
         // Validation: Verify series exists
         val series = seriesDao.getSeriesByIdSync(seriesId)
             ?: throw IllegalArgumentException("Referenced series $seriesId does not exist.")
@@ -289,190 +334,435 @@ class ManhwaTrackerService(
         }
     }
 
-    /**
-     * 10. Reading Statistics Calculation
-     * Distinguishes detected chapters from chapters actually read.
-     * Prevents double-counting.
-     */
-    fun getReadingStatistics(): Flow<ReadingStatistics> {
-        return combine(
-            seriesDao.getAllSeries(),
-            chapterDao.countTotalChaptersRead(),
-            chapterDao.countUnreadChapters(),
-            readingSessionDao.getTotalDurationSeconds()
-        ) { seriesList, totalReadChapters, totalUnreadChapters, totalDurationSec ->
-            val now = Instant.now()
-            val oneWeekAgo = now.minus(7, ChronoUnit.DAYS).toEpochMilli()
-            val oneMonthAgo = now.minus(30, ChronoUnit.DAYS).toEpochMilli()
+    /** Counts only currently-read chapter records whose explicit read timestamp falls in the range. */
+    suspend fun getReadChapterCountBetween(startInclusive: Long, endExclusive: Long): Int =
+        chapterDao.countReadChaptersBetween(startInclusive, endExclusive)
 
-            val weekChapters = readingSessionDao.getChaptersReadSince(oneWeekAgo)
-            val monthChapters = readingSessionDao.getChaptersReadSince(oneMonthAgo)
+    suspend fun getReadChapterTimestamps(): List<Long> = chapterDao.getReadChapterTimestamps()
 
-            val totalSec = totalDurationSec ?: (totalReadChapters * 300)
-            val hours = String.format("%.1f", totalSec / 3600.0f).toFloatOrNull() ?: 0f
+    /** Reading totals are derived from read chapter rows and measured session durations only. */
+    fun getReadingStatistics(): Flow<ReadingStatistics> = combine(
+        seriesDao.getAllSeries(),
+        chapterDao.countTotalChaptersRead(),
+        chapterDao.countUnreadChapters(),
+        readingSessionDao.getTotalDurationSeconds()
+    ) { seriesList, totalReadChapters, totalUnreadChapters, totalDurationSec ->
+        val zone = ZoneId.systemDefault()
+        val today = LocalDate.now(zone)
+        val weekStart = today.minusDays(6).atStartOfDay(zone).toInstant().toEpochMilli()
+        val monthStart = today.minusDays(29).atStartOfDay(zone).toInstant().toEpochMilli()
+        val end = today.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val weekChapters = chapterDao.countReadChaptersBetween(weekStart, end)
+        val monthChapters = chapterDao.countReadChaptersBetween(monthStart, end)
+        val totalSeconds = (totalDurationSec ?: 0).coerceAtLeast(0)
+        val totalHours = String.format(Locale.ROOT, "%.1f", totalSeconds / 3600.0).toFloat()
 
-            ReadingStatistics(
-                totalSeries = seriesList.size,
-                seriesReading = seriesList.count { it.readingStatus == "READING" },
-                seriesCompleted = seriesList.count { it.readingStatus == "COMPLETED" },
-                seriesDropped = seriesList.count { it.readingStatus == "DROPPED" },
-                seriesOnHold = seriesList.count { it.readingStatus == "ON_HOLD" },
-                seriesPlanToRead = seriesList.count { it.readingStatus == "PLAN_TO_READ" },
-                totalChaptersRead = totalReadChapters,
-                chaptersReadThisWeek = weekChapters.coerceAtLeast(totalReadChapters.coerceAtMost(5)),
-                chaptersReadThisMonth = monthChapters.coerceAtLeast(totalReadChapters.coerceAtMost(15)),
-                totalUnreadChapters = totalUnreadChapters,
-                totalHoursRead = hours
-            )
+        ReadingStatistics(
+            totalSeries = seriesList.size,
+            seriesReading = seriesList.count { it.readingStatus == "READING" },
+            seriesCompleted = seriesList.count { it.readingStatus == "COMPLETED" },
+            seriesDropped = seriesList.count { it.readingStatus == "DROPPED" },
+            seriesOnHold = seriesList.count { it.readingStatus == "ON_HOLD" },
+            seriesPlanToRead = seriesList.count { it.readingStatus == "PLAN_TO_READ" },
+            totalChaptersRead = totalReadChapters,
+            chaptersReadThisWeek = weekChapters.coerceAtLeast(0),
+            chaptersReadThisMonth = monthChapters.coerceAtLeast(0),
+            totalUnreadChapters = totalUnreadChapters,
+            totalHoursRead = totalHours
+        )
+    }
+
+    suspend fun findMatchingSeries(detected: DetectedManhwa): SeriesEntity? {
+        val canonicalDetected = sourceManager?.canonicalizeSeriesUrl(detected.sourceUrl, detected.sourceId)
+            ?: canonicalUrl(detected.sourceUrl, detected.sourceId)
+        seriesDao.findBySourceUrl(canonicalDetected)?.let { return it }
+        val detectedHost = hostOf(canonicalDetected)
+        val detectedTitle = normalizedTitle(detected.title)
+        return seriesDao.getAllSeriesSync().firstOrNull { series ->
+            val seriesCanonical = sourceManager?.canonicalizeSeriesUrl(series.sourceUrl, series.sourceId)
+                ?: canonicalUrl(series.sourceUrl, series.sourceId)
+            seriesCanonical == canonicalDetected ||
+                (detectedHost != null && hostOf(seriesCanonical) == detectedHost &&
+                    (normalizedTitle(series.title) == detectedTitle ||
+                        series.alternateTitles.orEmpty().split(',', ';', '|').any { normalizedTitle(it) == detectedTitle }))
         }
     }
 
-    /**
-     * 11. Export Library Data to JSON
-     */
-    suspend fun exportLibraryJson(): String {
-        val seriesList = seriesDao.getAllSeriesSync()
-        val root = JSONObject()
-        root.put("version", 2)
-        root.put("exportedAt", System.currentTimeMillis())
+    suspend fun findChapterIdForSession(seriesId: Long, identifier: String, chapterUrl: String): Long? {
+        chapterDao.findBySeriesAndIdentifier(seriesId, identifier)?.let { return it.id }
+        if (isHttpUrl(chapterUrl)) chapterDao.findBySeriesAndUrl(seriesId, chapterUrl)?.let { return it.id }
+        return null
+    }
 
-        val array = JSONArray()
-        for (series in seriesList) {
-            val seriesObj = JSONObject()
-            seriesObj.put("title", series.title)
-            seriesObj.put("alternateTitles", series.alternateTitles ?: "")
-            seriesObj.put("coverUrl", series.coverUrl ?: "")
-            seriesObj.put("sourceId", series.sourceId)
-            seriesObj.put("sourceName", series.sourceName)
-            seriesObj.put("sourceUrl", series.sourceUrl)
-            seriesObj.put("readingStatus", series.readingStatus)
-            seriesObj.put("rating", series.rating ?: 0.0)
-            seriesObj.put("description", series.description ?: "")
-            seriesObj.put("notes", series.notes)
-            seriesObj.put("latestChapterIdentifier", series.latestChapterIdentifier)
-            seriesObj.put("lastReadChapterIdentifier", series.lastReadChapterIdentifier)
-
-            val chapters = chapterDao.getChaptersForSeriesSync(series.id)
-            val chaptersArray = JSONArray()
-            for (ch in chapters) {
-                val chObj = JSONObject()
-                chObj.put("identifier", ch.chapterIdentifier)
-                chObj.put("number", ch.chapterNumber ?: -1.0)
-                chObj.put("title", ch.chapterTitle)
-                chObj.put("url", ch.chapterUrl)
-                chObj.put("isRead", ch.isRead)
-                chaptersArray.put(chObj)
-            }
-            seriesObj.put("chapters", chaptersArray)
-            array.put(seriesObj)
+    /** Progress is recorded only after an explicit user confirmation in the browser. */
+    suspend fun markDetectedChapterRead(seriesId: Long, detected: DetectedManhwa) {
+        require(detected.chapterNumber == null || detected.chapterNumber.isFinite() && detected.chapterNumber >= 0f) {
+            "Detected chapter number is invalid"
         }
-        root.put("series", array)
+        val identifier = detected.chapterIdentifier.trim()
+        require(identifier.isNotBlank() && identifier.length <= MAX_CHAPTER_IDENTIFIER_LENGTH) { "Invalid detected chapter identifier" }
+        val chapterUrl = detected.chapterUrl.takeIf(::isHttpUrl)
+            ?: detected.sourceUrl.takeIf(::isHttpUrl)
+            ?: throw IllegalArgumentException("Detected chapter has no valid HTTP(S) URL")
+        val title = detected.chapterTitle.trim().ifBlank { "Chapter $identifier" }.take(MAX_CHAPTER_TITLE_LENGTH)
+        val operation: suspend () -> Unit = {
+            upsertReadChapter(seriesId, identifier, detected.chapterNumber, title, chapterUrl)
+        }
+        if (database != null) database.withTransaction { operation() } else operation()
+    }
+
+    /** Manual progress path for unsupported websites; no source release checks are implied. */
+    suspend fun markManualChapterRead(
+        seriesId: Long,
+        identifier: String,
+        title: String = "",
+        chapterUrl: String? = null
+    ) {
+        val cleanIdentifier = identifier.trim()
+        require(cleanIdentifier.isNotBlank() && cleanIdentifier.length <= MAX_CHAPTER_IDENTIFIER_LENGTH) {
+            "Enter a chapter number or stable identifier"
+        }
+        val series = seriesDao.getSeriesByIdSync(seriesId)
+            ?: throw IllegalArgumentException("Series $seriesId is no longer in the library")
+        val number = cleanIdentifier.toFloatOrNull()?.takeIf { it.isFinite() && it >= 0f }
+        val cleanTitle = title.trim().ifBlank { "Chapter $cleanIdentifier" }.take(MAX_CHAPTER_TITLE_LENGTH)
+        val url = chapterUrl?.trim()?.takeIf(String::isNotBlank)?.also {
+            require(isHttpUrl(it)) { "Chapter URL must be HTTP(S)" }
+        } ?: series.sourceUrl
+        val operation: suspend () -> Unit = {
+            upsertReadChapter(seriesId, cleanIdentifier, number, cleanTitle, url)
+        }
+        if (database != null) database.withTransaction { operation() } else operation()
+    }
+
+    private suspend fun upsertReadChapter(
+        seriesId: Long,
+        identifier: String,
+        number: Float?,
+        title: String,
+        chapterUrl: String
+    ) {
+        val series = seriesDao.getSeriesByIdSync(seriesId)
+            ?: throw IllegalArgumentException("Series $seriesId is no longer in the library")
+        val previous = chapterDao.findBySeriesAndIdentifier(seriesId, identifier)
+            ?: chapterUrl.takeUnless { it == series.sourceUrl }?.let { chapterDao.findBySeriesAndUrl(seriesId, it) }
+        if (previous?.isRead == true && previous.chapterIdentifier == identifier) return
+        val now = System.currentTimeMillis()
+        if (previous != null) {
+            chapterDao.update(
+                previous.copy(
+                    chapterNumber = number ?: previous.chapterNumber,
+                    chapterIdentifier = identifier,
+                    chapterTitle = title,
+                    chapterUrl = chapterUrl,
+                    isRead = true,
+                    lastReadAt = now
+                )
+            )
+        } else {
+            chapterDao.insert(
+                ChapterEntity(
+                    seriesId = seriesId,
+                    chapterNumber = number,
+                    chapterIdentifier = identifier,
+                    chapterTitle = title,
+                    chapterUrl = chapterUrl,
+                    isRead = true,
+                    firstDetectedAt = now,
+                    lastReadAt = now
+                )
+            )
+        }
+        val chapterCount = chapterDao.getChaptersForSeriesSync(seriesId).size
+        seriesDao.update(
+            series.copy(
+                lastReadChapterIdentifier = identifier,
+                currentChapterNum = number ?: series.currentChapterNum,
+                totalChapters = maxOf(series.totalChapters, chapterCount),
+                lastReadTimestamp = now,
+                lastUpdated = now
+            )
+        )
+    }
+
+    /** Exports library metadata/progress only; page content, browser history, and private data are excluded. */
+    suspend fun exportLibraryJson(): String {
+        val root = JSONObject().apply {
+            put("format", IMPORT_FORMAT)
+            put("version", EXPORT_VERSION)
+            put("exportedAt", System.currentTimeMillis())
+        }
+        val seriesArray = JSONArray()
+        for (series in seriesDao.getAllSeriesSync()) {
+            val seriesObject = JSONObject().apply {
+                put("title", series.title)
+                put("alternateTitles", series.alternateTitles ?: JSONObject.NULL)
+                put("coverUrl", series.coverUrl ?: JSONObject.NULL)
+                put("sourceId", series.sourceId)
+                put("sourceName", series.sourceName)
+                put("sourceUrl", series.sourceUrl)
+                put("readingStatus", series.readingStatus)
+                put("rating", series.rating ?: JSONObject.NULL)
+                put("notes", series.notes)
+                put("latestChapterIdentifier", series.latestChapterIdentifier)
+                put("lastReadChapterIdentifier", series.lastReadChapterIdentifier)
+                put("currentChapterNum", series.currentChapterNum)
+                put("totalChapters", series.totalChapters)
+                put("dateAdded", series.dateAdded)
+                put("lastReadTimestamp", series.lastReadTimestamp)
+            }
+            val chapterArray = JSONArray()
+            for (chapter in chapterDao.getChaptersForSeriesSync(series.id)) {
+                chapterArray.put(JSONObject().apply {
+                    put("identifier", chapter.chapterIdentifier)
+                    put("number", chapter.chapterNumber ?: JSONObject.NULL)
+                    put("title", chapter.chapterTitle)
+                    put("url", chapter.chapterUrl)
+                    put("isRead", chapter.isRead)
+                    put("progressPercent", chapter.readProgressPercent)
+                    put("lastReadAt", chapter.lastReadAt)
+                })
+            }
+            seriesObject.put("chapters", chapterArray)
+            seriesArray.put(seriesObject)
+        }
+        root.put("series", seriesArray)
         return root.toString(2)
     }
 
-    /**
-     * 12. Import Library Data from JSON
-     */
-    suspend fun importLibraryJson(jsonString: String): Result<Int> {
-        return try {
-            val root = JSONObject(jsonString)
-            val array = root.getJSONArray("series")
-            var importedCount = 0
+    /** Parses and validates the entire portable file without changing the database. */
+    suspend fun previewLibraryJson(jsonString: String): Result<LibraryImportPreview> = runCatching {
+        require(jsonString.length <= MAX_IMPORT_CHARACTERS) { "Import file is too large" }
+        val root = JSONObject(jsonString)
+        val format = root.optString("format", "")
+        require(format.isBlank() || format == IMPORT_FORMAT) { "This is not a MangaFlow library export" }
+        val version = root.optInt("version", 0)
+        require(version in 2..EXPORT_VERSION) { "Unsupported library export version: $version" }
+        val seriesArray = root.optJSONArray("series") ?: throw IllegalArgumentException("Missing series list")
+        require(seriesArray.length() <= MAX_IMPORT_SERIES) { "Import contains too many series" }
 
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                val title = obj.getString("title")
-                val sourceUrl = obj.getString("sourceUrl")
-                val status = obj.optString("readingStatus", "READING")
-                val rating = if (obj.has("rating") && !obj.isNull("rating")) obj.getDouble("rating").toFloat() else null
-                val desc = obj.optString("description", "")
-                val alt = obj.optString("alternateTitles", "")
-                val cover = obj.optString("coverUrl", "")
+        val existing = seriesDao.getAllSeriesSync()
+        val knownUrls = existing.mapTo(mutableSetOf()) { canonicalUrl(it.sourceUrl) }
+        val knownTitles = existing.flatMapTo(mutableSetOf()) { series ->
+            buildList {
+                add(normalizedTitle(series.title))
+                series.alternateTitles.orEmpty().split(',', ';', '|').mapTo(this) { normalizedTitle(it) }
+            }
+        }
+        val seenUrls = mutableSetOf<String>()
+        val seenTitles = mutableSetOf<String>()
+        val valid = mutableListOf<PortableLibrarySeries>()
+        val errors = mutableListOf<String>()
+        var duplicates = 0
 
-                val seriesId = addSeriesManually(
-                    title = title,
-                    alternateTitles = if (alt.isNotBlank()) alt else null,
-                    sourceUrl = sourceUrl,
-                    coverUrl = if (cover.isNotBlank()) cover else null,
-                    readingStatus = status,
-                    rating = rating,
-                    description = if (desc.isNotBlank()) desc else null,
-                    initialChapterCount = 0
-                )
+        for (index in 0 until seriesArray.length()) {
+            val obj = seriesArray.optJSONObject(index)
+            if (obj == null) {
+                errors += "Entry ${index + 1}: expected a series object"
+                continue
+            }
+            val item = try {
+                parsePortableSeries(obj)
+            } catch (e: Exception) {
+                errors += "Entry ${index + 1}: ${e.message ?: "invalid metadata"}"
+                continue
+            }
+            val urlKey = canonicalUrl(item.sourceUrl)
+            val titleKey = normalizedTitle(item.title)
+            if (urlKey in knownUrls || titleKey in knownTitles || urlKey in seenUrls || titleKey in seenTitles) {
+                duplicates++
+            } else {
+                valid += item
+                seenUrls += urlKey
+                seenTitles += titleKey
+            }
+        }
+        LibraryImportPreview(
+            sourceVersion = version,
+            totalEntries = seriesArray.length(),
+            importableSeries = valid,
+            duplicateCount = duplicates,
+            invalidEntries = errors.take(MAX_PREVIEW_ERRORS)
+        )
+    }
 
-                if (obj.has("chapters")) {
-                    val chArray = obj.getJSONArray("chapters")
-                    for (c in 0 until chArray.length()) {
-                        val chObj = chArray.getJSONObject(c)
-                        val iden = chObj.getString("identifier")
-                        val num = if (chObj.has("number") && chObj.getDouble("number") >= 0) chObj.getDouble("number").toFloat() else null
-                        val chTitle = chObj.optString("title", "Chapter $iden")
-                        val chUrl = chObj.optString("url", "$sourceUrl/ch-$iden")
-                        val isRead = chObj.optBoolean("isRead", false)
-
-                        chapterDao.insert(
-                            ChapterEntity(
-                                seriesId = seriesId,
-                                chapterNumber = num,
-                                chapterIdentifier = iden,
-                                chapterTitle = chTitle,
-                                chapterUrl = chUrl,
-                                isRead = isRead,
-                                firstDetectedAt = System.currentTimeMillis()
-                            )
+    /** Applies only validated new entries, never overwriting duplicates or deleting existing data. */
+    suspend fun applyLibraryImport(preview: LibraryImportPreview): Result<Int> = runCatching {
+        importMutex.withLock {
+            val apply: suspend () -> Int = {
+                val existing = seriesDao.getAllSeriesSync()
+                val knownUrls = existing.mapTo(mutableSetOf()) { canonicalUrl(it.sourceUrl) }
+                val knownTitles = existing.mapTo(mutableSetOf()) { normalizedTitle(it.title) }
+                var imported = 0
+                for (item in preview.importableSeries) {
+                    val urlKey = canonicalUrl(item.sourceUrl)
+                    val titleKey = normalizedTitle(item.title)
+                    if (urlKey in knownUrls || titleKey in knownTitles) continue
+                    val now = System.currentTimeMillis()
+                    val id = seriesDao.insert(
+                        SeriesEntity(
+                            title = item.title,
+                            alternateTitles = item.alternateTitles,
+                            coverUrl = item.coverUrl,
+                            sourceId = item.sourceId,
+                            sourceName = item.sourceName,
+                            sourceUrl = item.sourceUrl,
+                            readingStatus = item.readingStatus,
+                            latestChapterIdentifier = item.latestChapterIdentifier,
+                            lastReadChapterIdentifier = item.lastReadChapterIdentifier,
+                            currentChapterNum = item.currentChapterNum,
+                            totalChapters = maxOf(item.totalChapters, item.chapters.size),
+                            rating = item.rating,
+                            notes = item.notes,
+                            dateAdded = item.dateAdded.takeIf { it > 0L } ?: now,
+                            lastReadTimestamp = item.lastReadTimestamp.coerceAtLeast(0L),
+                            lastUpdated = now
+                        )
+                    )
+                    val chapters = item.chapters.map { chapter ->
+                        ChapterEntity(
+                            seriesId = id,
+                            chapterNumber = chapter.number,
+                            chapterIdentifier = chapter.identifier,
+                            chapterTitle = chapter.title,
+                            chapterUrl = chapter.url,
+                            isRead = chapter.isRead,
+                            readProgressPercent = chapter.progressPercent,
+                            firstDetectedAt = now,
+                            lastReadAt = chapter.lastReadAt.coerceAtLeast(0L)
                         )
                     }
+                    if (chapters.isNotEmpty()) chapterDao.insertAll(chapters)
+                    knownUrls += urlKey
+                    knownTitles += titleKey
+                    imported++
                 }
-                importedCount++
+                imported
             }
-            Result.success(importedCount)
-        } catch (e: Exception) {
-            Result.failure(e)
+            if (database != null) database.withTransaction { apply() } else apply()
         }
     }
 
-    /**
-     * 13. Sample Data Loader
-     */
-    suspend fun loadSampleData() {
-        val samples = listOf(
-            Triple(
-                "Solo Leveling: Ragnarok",
-                "https://www.webtoons.com/en/fantasy/solo-leveling/chapter-120",
-                "https://images.unsplash.com/photo-1578632767115-351597cf2477?w=400"
-            ),
-            Triple(
-                "Omniscient Reader's Viewpoint",
-                "https://www.webtoons.com/en/action/omniscient-reader/episode-200",
-                "https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?w=400"
-            ),
-            Triple(
-                "Return of the Mount Hua Sect",
-                "https://www.webtoons.com/en/action/return-of-the-mount-hua-sect/ch-110",
-                "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=400"
-            ),
-            Triple(
-                "Tower of God",
-                "https://www.webtoons.com/en/fantasy/tower-of-god/season-3-ep-180",
-                "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=400"
-            )
-        )
+    /** Backwards-compatible safe import entry point; preview/apply is preferred by the UI. */
+    suspend fun importLibraryJson(jsonString: String): Result<Int> {
+        val preview = previewLibraryJson(jsonString)
+        if (preview.isFailure) return Result.failure(preview.exceptionOrNull()!!)
+        return applyLibraryImport(preview.getOrThrow())
+    }
 
-        for ((title, url, cover) in samples) {
-            val id = addSeriesManually(
-                title = title,
-                sourceUrl = url,
-                coverUrl = cover,
-                readingStatus = if (title.contains("Tower")) "ON_HOLD" else "READING",
-                rating = 4.9f,
-                description = "Follow the adventures and epic growth in this captivating manhwa series.",
-                initialChapterCount = 15
+    private fun parsePortableSeries(obj: JSONObject): PortableLibrarySeries {
+        val title = obj.optString("title").trim()
+        require(title.isNotBlank() && title.length <= 300) { "title is missing or too long" }
+        val sourceUrl = obj.optString("sourceUrl").trim()
+        require(isHttpUrl(sourceUrl)) { "source URL must be HTTP or HTTPS" }
+        val status = obj.optString("readingStatus", "READING").uppercase()
+        require(status in ALLOWED_READING_STATUSES) { "invalid reading status" }
+        val rating = if (!obj.has("rating") || obj.isNull("rating")) null else obj.optDouble("rating", Double.NaN).toFloat()
+        require(rating == null || rating.isFinite() && rating in 0f..5f) { "rating must be between 0 and 5" }
+        val cover = optionalHttpUrl(obj.optString("coverUrl", ""), "cover URL")
+        val chapterArray = obj.optJSONArray("chapters") ?: JSONArray()
+        require(chapterArray.length() <= MAX_CHAPTERS_PER_SERIES) { "too many chapters" }
+        val chapterList = mutableListOf<PortableLibraryChapter>()
+        val seenIdentifiers = mutableSetOf<String>()
+        for (index in 0 until chapterArray.length()) {
+            val chapter = chapterArray.optJSONObject(index) ?: throw IllegalArgumentException("chapter ${index + 1} is malformed")
+            val identifier = chapter.optString("identifier").trim()
+            require(identifier.isNotBlank() && identifier.length <= 120) { "chapter identifier is missing or too long" }
+            if (!seenIdentifiers.add(identifier)) continue
+            val url = chapter.optString("url", sourceUrl).ifBlank { sourceUrl }
+            require(isHttpUrl(url)) { "chapter URL must be HTTP or HTTPS" }
+            val numberValue = if (!chapter.has("number") || chapter.isNull("number")) null else chapter.optDouble("number", Double.NaN)
+            require(numberValue == null || numberValue.isFinite() && numberValue in 0.0..100_000_000.0) { "invalid chapter number" }
+            val progress = chapter.optDouble("progressPercent", 0.0).toFloat()
+            require(progress.isFinite() && progress in 0f..1f) { "chapter progress must be between 0 and 1" }
+            val chapterTitle = chapter.optString("title", "Chapter $identifier").take(500)
+            chapterList += PortableLibraryChapter(
+                identifier = identifier,
+                number = numberValue?.toFloat(),
+                title = chapterTitle,
+                url = url,
+                isRead = chapter.optBoolean("isRead", false),
+                progressPercent = progress,
+                lastReadAt = chapter.optLong("lastReadAt", 0L).coerceAtLeast(0L)
             )
-            // Mark first 5 chapters read
-            for (ch in 1..5) {
-                chapterDao.updateReadStatusByIdentifier(id, ch.toString(), true, System.currentTimeMillis())
-            }
         }
+        val currentChapter = obj.optDouble("currentChapterNum", 0.0).toFloat()
+        require(currentChapter.isFinite() && currentChapter in 0f..100_000_000f) { "invalid progress value" }
+        val totalChapters = obj.optInt("totalChapters", chapterList.size).coerceIn(0, MAX_CHAPTERS_PER_SERIES)
+        val notes = obj.optString("notes", "")
+        require(notes.length <= MAX_NOTES_CHARACTERS) { "notes are too long" }
+        return PortableLibrarySeries(
+            title = title,
+            alternateTitles = optionalText(obj, "alternateTitles", 1_000),
+            coverUrl = cover,
+            sourceId = obj.optString("sourceId", "web").take(120),
+            sourceName = obj.optString("sourceName", "Web Source").take(200),
+            sourceUrl = sourceUrl,
+            readingStatus = status,
+            latestChapterIdentifier = obj.optString("latestChapterIdentifier", "0").take(120),
+            lastReadChapterIdentifier = obj.optString("lastReadChapterIdentifier", "0").take(120),
+            currentChapterNum = currentChapter,
+            totalChapters = totalChapters,
+            rating = rating,
+            notes = notes,
+            dateAdded = obj.optLong("dateAdded", System.currentTimeMillis()).coerceAtLeast(0L),
+            lastReadTimestamp = obj.optLong("lastReadTimestamp", 0L).coerceAtLeast(0L),
+            chapters = chapterList
+        )
+    }
+
+    private fun optionalText(obj: JSONObject, key: String, maxLength: Int): String? {
+        if (!obj.has(key) || obj.isNull(key)) return null
+        val value = obj.optString(key).trim()
+        require(value.length <= maxLength) { "$key is too long" }
+        return value.takeIf(String::isNotBlank)
+    }
+
+    private fun optionalHttpUrl(value: String, label: String): String? {
+        if (value.isBlank() || value == "null") return null
+        require(isHttpUrl(value)) { "$label must be HTTP or HTTPS" }
+        return value
+    }
+
+    private fun isHttpUrl(value: String): Boolean = try {
+        val uri = URI(value)
+        uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.userInfo == null
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun canonicalUrl(value: String, preferredSourceId: String? = null): String =
+        sourceManager?.canonicalizeSeriesUrl(value, preferredSourceId)
+            ?: try {
+                val uri = URI(value).normalize()
+                "${uri.scheme?.lowercase()}://${uri.host?.lowercase()}${uri.path.orEmpty().trimEnd('/')}" +
+                    (uri.query?.let { "?$it" } ?: "")
+            } catch (_: Exception) {
+                value.trim().trimEnd('/').lowercase()
+            }
+
+    private fun hostOf(value: String): String? = try {
+        URI(value).host?.lowercase()?.removePrefix("www.")
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun normalizedTitle(value: String): String = Normalizer.normalize(value, Normalizer.Form.NFKD)
+        .lowercase()
+        .replace(Regex("[^\\p{L}\\p{N}]"), "")
+
+    companion object {
+        private const val IMPORT_FORMAT = "mangaflow-library"
+        private const val EXPORT_VERSION = 3
+        private const val MAX_IMPORT_CHARACTERS = 8 * 1024 * 1024
+        private const val MAX_IMPORT_SERIES = 2_000
+        private const val MAX_CHAPTERS_PER_SERIES = 10_000
+        private const val MAX_PREVIEW_ERRORS = 100
+        private const val MAX_NOTES_CHARACTERS = 10_000
+        private const val MAX_KNOWN_CHAPTER_COUNT = 100_000
+        private const val MAX_CHAPTER_IDENTIFIER_LENGTH = 200
+        private const val MAX_CHAPTER_TITLE_LENGTH = 500
+        private val ALLOWED_READING_STATUSES = setOf("READING", "PLAN_TO_READ", "COMPLETED", "ON_HOLD", "DROPPED")
     }
 
     /**

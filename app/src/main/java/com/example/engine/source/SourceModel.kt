@@ -1,7 +1,8 @@
 package com.example.engine.source
 
 /**
- * Declares capabilities supported by a specific source adapter.
+ * Capabilities are deliberately explicit: metadata-only sources must never be treated as
+ * automatic release trackers.
  */
 data class SourceCapabilities(
     val supportsMetadataLookup: Boolean = true,
@@ -12,34 +13,54 @@ data class SourceCapabilities(
     val rateLimitRequestsPerMinute: Int = 30
 )
 
-/**
- * Normalized metadata for a tracked series retrieved from a source.
- */
+/** Normalized metadata returned by a source adapter. */
 data class SourceSeriesMetadata(
     val title: String,
     val alternateTitles: List<String> = emptyList(),
     val coverUrl: String? = null,
     val description: String? = null,
     val author: String? = null,
-    val status: String? = null, // e.g. "ongoing", "completed"
-    val latestChapterIdentifier: String? = null
+    val status: String? = null,
+    val latestChapterIdentifier: String? = null,
+    val canonicalUrl: String? = null
 )
 
-/**
- * Normalized chapter item retrieved from a source.
- */
+/** A normalized, stable chapter identity. */
 data class SourceChapter(
-    val identifier: String, // e.g. "120", "12.5", "prologue", "extra-1"
-    val number: Float? = null, // Numeric representation when available, null for non-numeric
-    val title: String, // e.g. "Chapter 120 - Awakened Power"
+    val identifier: String,
+    val number: Float? = null,
+    val title: String,
     val url: String,
-    val publishedAt: Long? = null // Epoch millis, null when unknown
+    val publishedAt: Long? = null
 )
 
 /**
- * Sealed result type distinguishing different outcomes of source queries.
- * Prevents false positives, silent failures, and respects rate limits.
+ * Evidence extracted from a loaded URL without making a network request. Page title/metadata may
+ * help label a URL, but must not be the sole evidence that a page is a chapter.
  */
+data class SourceChapterEvidence(
+    val sourceId: String,
+    val canonicalSeriesUrl: String,
+    val chapterIdentifier: String,
+    val chapterNumber: Float?,
+    val chapterTitle: String,
+    val chapterUrl: String,
+    val confidence: Float,
+    val evidence: String,
+    val seriesTitle: String? = null
+)
+
+/** Last in-process adapter outcome, used by the source-management UI. */
+data class SourceRuntimeStatus(
+    val sourceId: String,
+    val lastStatus: String = "NOT_CHECKED",
+    val lastSuccessAt: Long? = null,
+    val lastErrorAt: Long? = null,
+    val lastErrorMessage: String? = null,
+    val lastCheckedAt: Long? = null
+)
+
+/** Distinct outcomes keep unsupported sources and parse failures from looking like empty feeds. */
 sealed class SourceResult<out T> {
     data class Success<out T>(val data: T) : SourceResult<T>()
     data class NoNewChapters(

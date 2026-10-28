@@ -19,6 +19,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -58,12 +59,21 @@ fun AppNavigation(
     libraryViewModel: LibraryViewModel = viewModel(),
     settingsViewModel: SettingsViewModel = viewModel(),
     statsViewModel: ReadingStatsViewModel = viewModel(),
+    initialOpenUrl: String? = null,
+    openUrlRequestId: Long = 0L,
     modifier: Modifier = Modifier
 ) {
     var currentDestination by remember { mutableStateOf(AppDestination.HOME) }
     var selectedManhwaId by remember { mutableStateOf<Long?>(null) }
     var viewingStatsFromHome by remember { mutableStateOf(false) }
     val isPrivate by browserViewModel.isPrivateMode.collectAsState()
+
+    LaunchedEffect(openUrlRequestId, initialOpenUrl) {
+        if (!initialOpenUrl.isNullOrBlank()) {
+            browserViewModel.openNormalAddress(initialOpenUrl)
+            currentDestination = AppDestination.BROWSER
+        }
+    }
 
     // Android Hardware Back Handler behavior
     BackHandler(enabled = selectedManhwaId != null || viewingStatsFromHome || currentDestination != AppDestination.HOME) {

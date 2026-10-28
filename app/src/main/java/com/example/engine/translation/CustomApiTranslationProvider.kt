@@ -9,6 +9,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.URI
 import java.util.concurrent.TimeUnit
 
 /**
@@ -19,6 +20,8 @@ class CustomApiTranslationProvider(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build(),
     var endpointUrl: String = "https://libretranslate.com/translate",
     var apiKey: String? = null,
@@ -38,6 +41,9 @@ class CustomApiTranslationProvider(
 
         if (!isCloudPermittedByUser) {
             return@withContext TranslationResult.CloudTranslationNotPermitted
+        }
+        if (!isAllowedEndpoint(endpointUrl)) {
+            return@withContext TranslationResult.Error("Custom endpoint must use HTTPS; HTTP is allowed only for loopback testing.")
         }
 
         val trimmed = request.text.trim()
@@ -101,10 +107,23 @@ class CustomApiTranslationProvider(
                     )
                 )
             }
-        } catch (e: IOException) {
-            TranslationResult.Error("Failed to reach custom translation API: ${e.message}", e)
-        } catch (e: Exception) {
-            TranslationResult.Error("Failed to parse response: ${e.message}", e)
+        } catch (_: IOException) {
+            TranslationResult.Error("Failed to reach the custom translation API")
+        } catch (_: Exception) {
+            TranslationResult.Error("The custom translation API returned an unreadable response")
+        }
+    }
+
+    private fun isAllowedEndpoint(value: String): Boolean {
+        if (value.length !in 10..2048) return false
+        return try {
+            val uri = URI(value)
+            val scheme = uri.scheme?.lowercase()
+            val host = uri.host?.lowercase() ?: return false
+            val loopback = host in setOf("localhost", "127.0.0.1", "::1", "[::1]")
+            uri.userInfo == null && (scheme == "https" || (scheme == "http" && loopback))
+        } catch (_: Exception) {
+            false
         }
     }
 }

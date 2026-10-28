@@ -133,6 +133,14 @@ class TranslationAndOcrTest {
     }
 
     @Test
+    fun testCustomTranslationEndpointRequiresTlsOutsideLoopback() {
+        assertFalse(translationManager.setCustomApiCredentials("http://translate.example/api", "secret"))
+        assertTrue(translationManager.setCustomApiCredentials("http://localhost:5000/translate", null))
+        assertEquals("", translationManager.getCustomApiKey())
+        assertTrue(translationManager.setCustomApiCredentials("https://translate.example/api", null))
+    }
+
+    @Test
     fun testTranslationManager_cachesTranslations() = runBlocking {
         translationManager.setActiveProvider("on_device")
         translationManager.setCacheTranslations(true)

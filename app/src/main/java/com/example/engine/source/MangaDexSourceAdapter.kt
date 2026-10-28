@@ -2,204 +2,229 @@ package com.example.engine.source
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 import java.io.IOException
-import java.text.SimpleDateFormat
+import java.net.URI
+import java.time.Instant
 import java.util.Locale
-import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
-/**
- * Official API Adapter for MangaDex (https://api.mangadex.org).
- * Uses official, permitted REST endpoints for series and chapter metadata.
- * Complies with rate limits (5 requests per second max) and API guidelines.
- */
+/** Official MangaDex API integration. It does not scrape reader pages or bypass access controls. */
 class MangaDexSourceAdapter(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
         .build()
 ) : SourceAdapter {
 
     override val sourceId: String = "mangadex"
     override val displayName: String = "MangaDex (Official API)"
     override val baseUrl: String = "https://mangadex.org"
-    override val capabilities: SourceCapabilities = SourceCapabilities(
+    override val capabilities = SourceCapabilities(
         supportsMetadataLookup = true,
         supportsChapterList = true,
         supportsUpdateDetection = true,
-        supportsRssFeed = false,
         isOfficialApi = true,
         rateLimitRequestsPerMinute = 30
     )
 
-    private val uuidRegex = Regex("""([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})""")
+    private val validHosts = setOf("mangadex.org", "www.mangadex.org", "api.mangadex.org")
+    private val uuidRegex = Regex("""^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$""")
 
     override fun canHandle(url: String): Boolean {
-        return url.contains("mangadex.org", ignoreCase = true) ||
-                url.contains("api.mangadex.org", ignoreCase = true)
+        val uri = parseHttpUri(url) ?: return false
+        return uri.host?.lowercase(Locale.ROOT) in validHosts
     }
 
-    /**
-     * Extracts the MangaDex series UUID from a user-supplied URL or slug.
-     */
+    override fun canonicalizeSeriesUrl(sourceUrl: String): String? {
+        if (!canHandle(sourceUrl)) return null
+        val id = extractMangaId(sourceUrl) ?: return canonicalHttpUrl(sourceUrl)
+        return "$baseUrl/title/$id"
+    }
+
+    override fun identifyChapter(pageUrl: String, pageTitle: String?): SourceChapterEvidence? {
+        if (!canHandle(pageUrl)) return null
+        val uri = parseHttpUri(pageUrl) ?: return null
+        val segments = uri.path.orEmpty().split('/').filter(String::isNotBlank)
+        val chapterIndex = segments.indexOfFirst { it.equals("chapter", ignoreCase = true) }
+        val chapterUuid = segments.getOrNull(chapterIndex + 1)?.takeIf(uuidRegex::matches)
+            ?.lowercase(Locale.ROOT) ?: return null
+        // MangaDex chapter URLs normally omit the parent title. Only identify pages where the
+        // series UUID is also present in a recognized title route; never guess the parent series.
+        val mangaId = extractMangaId(pageUrl) ?: return null
+        val rawTitle = pageTitle.orEmpty().trim().take(300)
+        val number = Regex("""(?i)(?:chapter|ch\\.?|episode|ep\\.?)\\s*([0-9]+(?:\\.[0-9]+)?)""")
+            .find(rawTitle)?.groupValues?.getOrNull(1)?.toFloatOrNull()
+            ?.takeIf { it.isFinite() && it >= 0f }
+        val chapterTitle = rawTitle.ifBlank { "MangaDex chapter $chapterUuid" }
+        return SourceChapterEvidence(
+            sourceId = sourceId,
+            canonicalSeriesUrl = "$baseUrl/title/$mangaId",
+            chapterIdentifier = "mangadex-$chapterUuid",
+            chapterNumber = number,
+            chapterTitle = chapterTitle,
+            chapterUrl = canonicalHttpUrl(pageUrl) ?: return null,
+            confidence = if (number != null) 0.98f else 0.90f,
+            evidence = "MangaDex chapter UUID within a recognized title route",
+            seriesTitle = rawTitle.takeIf(String::isNotBlank)
+                ?.replace(Regex("(?i)\\s*[-|:]\\s*MangaDex.*$"), "")
+                ?.takeIf(String::isNotBlank)
+        )
+    }
+
+    /** Extracts an ID only from a MangaDex domain and a recognized title/API path. */
     fun extractMangaId(url: String): String? {
-        val match = uuidRegex.find(url)
-        return match?.groupValues?.get(1)
+        val uri = parseHttpUri(url) ?: return null
+        if (uri.host?.lowercase(Locale.ROOT) !in validHosts) return null
+        val segments = uri.path.orEmpty().split('/').filter(String::isNotBlank)
+        val candidate = when {
+            segments.size >= 2 && segments[0].equals("title", ignoreCase = true) -> segments[1]
+            segments.size >= 2 && segments[0].equals("manga", ignoreCase = true) -> segments[1]
+            else -> null
+        }
+        return candidate?.takeIf(uuidRegex::matches)?.lowercase(Locale.ROOT)
     }
 
     override suspend fun fetchSeriesMetadata(sourceUrl: String): SourceResult<SourceSeriesMetadata> = withContext(Dispatchers.IO) {
         val mangaId = extractMangaId(sourceUrl)
-            ?: return@withContext SourceResult.Unsupported("Could not extract MangaDex UUID from: $sourceUrl")
-
-        val apiUrl = "https://api.mangadex.org/manga/$mangaId"
-        val request = Request.Builder()
-            .url(apiUrl)
-            .header("User-Agent", "MangaFlow-Android/1.0 (https://github.com/mangaflow)")
-            .build()
+            ?: return@withContext SourceResult.Unsupported("A MangaDex title URL with a valid title UUID is required")
+        val request = apiRequest("manga/$mangaId")
 
         try {
             client.newCall(request).execute().use { response ->
-                when {
-                    response.code == 429 -> {
-                        val retryHeader = response.header("Retry-After")?.toLongOrNull() ?: 10L
-                        return@withContext SourceResult.RateLimited(retryHeader, "MangaDex rate limit reached")
-                    }
-                    response.code in 500..599 -> {
-                        return@withContext SourceResult.SourceUnavailable(response.code, "MangaDex server error")
-                    }
-                    response.code == 404 -> {
-                        return@withContext SourceResult.SourceUnavailable(404, "Series not found on MangaDex")
-                    }
-                    !response.isSuccessful -> {
-                        return@withContext SourceResult.SourceUnavailable(response.code, "HTTP ${response.code}")
-                    }
-                }
-
+                responseError(response.code)?.let { return@withContext it }
                 val body = response.body?.string()
                     ?: return@withContext SourceResult.ParsingError("Empty response body from MangaDex")
-
-                val json = JSONObject(body)
-                val dataObj = json.getJSONObject("data")
-                val attr = dataObj.getJSONObject("attributes")
-
-                // Extract title
-                val titlesObj = attr.getJSONObject("title")
-                val title = when {
-                    titlesObj.has("en") -> titlesObj.getString("en")
-                    titlesObj.has("ko") -> titlesObj.getString("ko")
-                    titlesObj.has("ja") -> titlesObj.getString("ja")
-                    titlesObj.keys().hasNext() -> titlesObj.getString(titlesObj.keys().next())
-                    else -> "Unknown Title"
-                }
-
-                // Extract description
-                val descObj = attr.optJSONObject("description")
-                val desc = descObj?.optString("en", "")?.ifBlank { null }
-
-                val status = attr.optString("status", "ongoing")
-                val latestChapter = attr.optString("lastChapter", "")
+                val root = JSONObject(body)
+                val data = root.optJSONObject("data")
+                    ?: return@withContext SourceResult.ParsingError("MangaDex response is missing manga data")
+                val attributes = data.optJSONObject("attributes")
+                    ?: return@withContext SourceResult.ParsingError("MangaDex response is missing manga attributes")
+                val title = chooseLocalizedText(attributes.optJSONObject("title"))
+                    ?: return@withContext SourceResult.ParsingError("MangaDex response has no usable title")
+                val description = chooseLocalizedText(attributes.optJSONObject("description"))
+                val canonical = canonicalizeSeriesUrl(sourceUrl)
 
                 SourceResult.Success(
                     SourceSeriesMetadata(
                         title = title,
-                        description = desc,
-                        status = status,
-                        latestChapterIdentifier = latestChapter.ifBlank { null }
+                        description = description,
+                        status = attributes.optString("status").takeIf(String::isNotBlank),
+                        latestChapterIdentifier = attributes.optString("lastChapter").takeIf(String::isNotBlank),
+                        canonicalUrl = canonical
                     )
                 )
             }
-        } catch (e: IOException) {
-            SourceResult.NetworkError("Failed to connect to MangaDex API: ${e.message}", e)
-        } catch (e: Exception) {
-            SourceResult.ParsingError("Failed to parse MangaDex JSON: ${e.message}")
+        } catch (failure: IOException) {
+            SourceResult.NetworkError("Failed to connect to MangaDex API: ${failure.message ?: "network error"}", failure)
+        } catch (failure: Exception) {
+            SourceResult.ParsingError("Failed to parse MangaDex metadata: ${failure.message ?: "invalid response"}")
         }
     }
 
     override suspend fun fetchChapters(sourceUrl: String): SourceResult<List<SourceChapter>> = withContext(Dispatchers.IO) {
         val mangaId = extractMangaId(sourceUrl)
-            ?: return@withContext SourceResult.Unsupported("Could not extract MangaDex UUID from: $sourceUrl")
-
-        val apiUrl = "https://api.mangadex.org/manga/$mangaId/feed?translatedLanguage[]=en&order[chapter]=desc&limit=100"
-        val request = Request.Builder()
-            .url(apiUrl)
-            .header("User-Agent", "MangaFlow-Android/1.0 (https://github.com/mangaflow)")
-            .build()
+            ?: return@withContext SourceResult.Unsupported("A MangaDex title URL with a valid title UUID is required")
+        val request = apiRequest("manga/$mangaId/feed") {
+            addQueryParameter("translatedLanguage[]", "en")
+            addQueryParameter("order[chapter]", "desc")
+            addQueryParameter("limit", "100")
+        }
 
         try {
             client.newCall(request).execute().use { response ->
-                when {
-                    response.code == 429 -> {
-                        val retryHeader = response.header("Retry-After")?.toLongOrNull() ?: 10L
-                        return@withContext SourceResult.RateLimited(retryHeader, "MangaDex rate limit reached")
-                    }
-                    response.code in 500..599 -> {
-                        return@withContext SourceResult.SourceUnavailable(response.code, "MangaDex server error")
-                    }
-                    !response.isSuccessful -> {
-                        return@withContext SourceResult.SourceUnavailable(response.code, "HTTP ${response.code}")
-                    }
-                }
-
+                responseError(response.code)?.let { return@withContext it }
                 val body = response.body?.string()
-                    ?: return@withContext SourceResult.ParsingError("Empty response body from MangaDex")
-
-                val json = JSONObject(body)
-                val dataArray = json.getJSONArray("data")
-                val chapters = mutableListOf<SourceChapter>()
-
-                for (i in 0 until dataArray.length()) {
-                    val chObj = dataArray.getJSONObject(i)
-                    val chId = chObj.getString("id")
-                    val attr = chObj.getJSONObject("attributes")
-
-                    val rawChapterStr = attr.optString("chapter", "")
-                    val rawTitle = attr.optString("title", "")
-                    val publishAtStr = attr.optString("publishAt", "")
-
-                    val (iden, num, formattedTitle) = ChapterNormalizer.normalizeChapter(
-                        rawIdentifier = rawChapterStr.ifBlank { null },
-                        rawTitle = if (rawTitle.isNotBlank()) "Chapter $rawChapterStr: $rawTitle" else "Chapter $rawChapterStr",
-                        url = "https://mangadex.org/chapter/$chId"
-                    )
-
-                    val publishTimestamp = parseIso8601Timestamp(publishAtStr)
-
-                    chapters.add(
-                        SourceChapter(
-                            identifier = iden,
-                            number = num,
-                            title = formattedTitle,
-                            url = "https://mangadex.org/chapter/$chId",
-                            publishedAt = publishTimestamp
+                    ?: return@withContext SourceResult.ParsingError("Empty MangaDex chapter response")
+                val data = JSONObject(body).optJSONArray("data")
+                    ?: return@withContext SourceResult.ParsingError("MangaDex chapter response is missing its data array")
+                val chapters = buildList {
+                    for (index in 0 until data.length()) {
+                        val chapterObject = data.optJSONObject(index) ?: continue
+                        val chapterUuid = chapterObject.optString("id").takeIf(String::isNotBlank) ?: continue
+                        val attributes = chapterObject.optJSONObject("attributes") ?: continue
+                        val rawNumber = attributes.optString("chapter").trim()
+                        val rawTitle = attributes.optString("title").trim()
+                        val chapterUrl = "$baseUrl/chapter/$chapterUuid"
+                        val displayTitle = when {
+                            rawNumber.isNotBlank() && rawTitle.isNotBlank() -> "Chapter $rawNumber — $rawTitle"
+                            rawNumber.isNotBlank() -> "Chapter $rawNumber"
+                            rawTitle.isNotBlank() -> rawTitle
+                            else -> "Chapter"
+                        }
+                        val (_, number, normalizedTitle) = ChapterNormalizer.normalizeChapter(
+                            rawIdentifier = rawNumber.ifBlank { null },
+                            rawTitle = displayTitle,
+                            url = chapterUrl
                         )
-                    )
+                        add(
+                            SourceChapter(
+                                identifier = "mangadex-$chapterUuid",
+                                number = number,
+                                title = normalizedTitle.ifBlank { displayTitle },
+                                url = chapterUrl,
+                                publishedAt = parseTimestamp(attributes.optString("publishAt"))
+                            )
+                        )
+                    }
                 }
-
-                if (chapters.isEmpty()) {
-                    SourceResult.NoNewChapters("0")
-                } else {
-                    SourceResult.Success(ChapterNormalizer.sortChapters(chapters))
-                }
+                SourceResult.Success(ChapterNormalizer.sortChapters(chapters))
             }
-        } catch (e: IOException) {
-            SourceResult.NetworkError("Failed to connect to MangaDex chapter feed: ${e.message}", e)
-        } catch (e: Exception) {
-            SourceResult.ParsingError("Failed to parse MangaDex chapter feed: ${e.message}")
+        } catch (failure: IOException) {
+            SourceResult.NetworkError("Failed to fetch MangaDex chapters: ${failure.message ?: "network error"}", failure)
+        } catch (failure: Exception) {
+            SourceResult.ParsingError("Failed to parse MangaDex chapter feed: ${failure.message ?: "invalid response"}")
         }
     }
 
-    private fun parseIso8601Timestamp(isoString: String): Long? {
-        if (isoString.isBlank()) return null
-        return try {
-            val format = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
-                timeZone = TimeZone.getTimeZone("UTC")
-            }
-            format.parse(isoString.substringBefore("+").substringBefore("Z"))?.time
-        } catch (_: Exception) {
-            null
+    private fun apiRequest(path: String, configure: HttpUrl.Builder.() -> Unit = {}): Request {
+        val url = "https://api.mangadex.org".toHttpUrl().newBuilder()
+            .addPathSegments(path)
+            .apply(configure)
+            .build()
+        return Request.Builder()
+            .url(url)
+            .header("User-Agent", "MangaFlow-Android/1.0 (https://github.com/hemachandiran843-hub/Mangaflow)")
+            .header("Accept", "application/json")
+            .build()
+    }
+
+    private fun responseError(code: Int): SourceResult<Nothing>? = when {
+        code == 429 -> SourceResult.RateLimited(10L, "MangaDex rate limit reached")
+        code == 404 -> SourceResult.SourceUnavailable(404, "MangaDex item was not found")
+        code in 500..599 -> SourceResult.SourceUnavailable(code, "MangaDex server error")
+        code !in 200..299 -> SourceResult.SourceUnavailable(code, "MangaDex returned HTTP $code")
+        else -> null
+    }
+
+    private fun chooseLocalizedText(obj: JSONObject?): String? {
+        if (obj == null) return null
+        for (language in listOf("en", "ko", "ja")) {
+            obj.optString(language).takeIf(String::isNotBlank)?.let { return it.trim() }
         }
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            obj.optString(keys.next()).takeIf(String::isNotBlank)?.let { return it.trim() }
+        }
+        return null
+    }
+
+    private fun parseTimestamp(raw: String): Long? = try {
+        raw.takeIf(String::isNotBlank)?.let { Instant.parse(it).toEpochMilli() }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun parseHttpUri(url: String): URI? = try {
+        URI(url.trim()).takeIf {
+            it.scheme?.lowercase(Locale.ROOT) in setOf("http", "https") && it.userInfo == null
+        }
+    } catch (_: Exception) {
+        null
     }
 }

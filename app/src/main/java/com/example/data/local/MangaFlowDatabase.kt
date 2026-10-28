@@ -37,7 +37,7 @@ import com.example.data.local.entity.SeriesEntity
         ContentSourceEntity::class,
         HistoryEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class MangaFlowDatabase : RoomDatabase() {
@@ -249,6 +249,14 @@ abstract class MangaFlowDatabase : RoomDatabase() {
             }
         }
 
+        /** Allows distinct manually tracked chapters to share a listing-page URL; preserves rows. */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP INDEX IF EXISTS `index_chapters_seriesId_chapterUrl`")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_chapters_seriesId_chapterUrl` ON `chapters` (`seriesId`, `chapterUrl`)")
+            }
+        }
+
         fun getDatabase(context: Context): MangaFlowDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -256,8 +264,7 @@ abstract class MangaFlowDatabase : RoomDatabase() {
                     MangaFlowDatabase::class.java,
                     "mangaflow_database"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
-                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                 INSTANCE = instance
                 instance

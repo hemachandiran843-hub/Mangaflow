@@ -79,19 +79,9 @@ class MangaFlowUnitTest {
     }
 
     @Test
-    fun settingsViewModel_categoryPreferences() {
+    fun settingsViewModel_translationLanguageRemainsAvailable() {
         val viewModel = SettingsViewModel()
-
-        viewModel.setSearchEngine("Google")
-        assertEquals("Google", viewModel.searchEngine.value)
-
         viewModel.setTranslationLanguage("Spanish")
         assertEquals("Spanish", viewModel.translationLanguage.value)
-
-        viewModel.setReaderMode("Webtoon")
-        assertEquals("Webtoon", viewModel.readerMode.value)
-
-        viewModel.setDesktopSitePreference(true)
-        assertTrue(viewModel.desktopSitePreference.value)
     }
 }

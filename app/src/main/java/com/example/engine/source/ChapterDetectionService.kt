@@ -13,6 +13,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
@@ -47,9 +49,11 @@ class ChapterDetectionService(
     private val seriesDao: SeriesDao,
     private val chapterDao: ChapterDao,
     private val notificationDao: NotificationDao,
-    private val sourceRegistry: SourceRegistry,
+    sourceRegistry: SourceRegistry,
     private val privacyManager: PrivacyManager,
-    private val appContext: Context? = null
+    private val appContext: Context? = null,
+    private val notificationsEnabled: () -> Boolean = { true },
+    private val sourceManager: SourceManager = SourceManager(sourceRegistry)
 ) {
     private val _serviceState = MutableStateFlow(DetectionServiceState())
     val serviceState: StateFlow<DetectionServiceState> = _serviceState.asStateFlow()
@@ -61,6 +65,9 @@ class ChapterDetectionService(
         val consecutiveFailures: Int,
         val backoffUntil: Long
     )
+
+    private suspend fun <T> withSeriesLock(seriesId: Long, action: suspend () -> T): T =
+        SERIES_LOCKS.computeIfAbsent(seriesId) { Mutex() }.withLock { action() }
 
     /**
      * Checks all series where isMonitoringEnabled is true.
@@ -74,10 +81,10 @@ class ChapterDetectionService(
 
         try {
             for (series in monitoredSeries) {
-                val res = checkSeriesInternal(series, force)
+                val res = withSeriesLock(series.id) { checkSeriesInternal(series, force) }
                 results[series.id] = res
                 newChaptersTotal += res.newChaptersCount
-                if (res.status !in listOf("SUCCESS", "NO_NEW_CHAPTERS")) {
+                if (res.status !in listOf("SUCCESS", "NO_NEW_CHAPTERS", "PRIVATE_SESSION_SUPPRESSED")) {
                     failedCount++
                 }
             }
@@ -107,7 +114,7 @@ class ChapterDetectionService(
                 errorMessage = "Series not found"
             )
 
-        val res = checkSeriesInternal(series, force)
+        val res = withSeriesLock(seriesId) { checkSeriesInternal(series, force) }
         val updatedMap = _serviceState.value.recentResults.toMutableMap()
         updatedMap[seriesId] = res
         _serviceState.value = _serviceState.value.copy(
@@ -118,6 +125,14 @@ class ChapterDetectionService(
     }
 
     private suspend fun checkSeriesInternal(series: SeriesEntity, force: Boolean): DetectionResult {
+        if (privacyManager.isPrivateSessionActive()) {
+            return DetectionResult(
+                seriesId = series.id,
+                seriesTitle = series.title,
+                status = "PRIVATE_SESSION_SUPPRESSED",
+                errorMessage = "Automatic tracking is paused while private browsing is active"
+            )
+        }
         val now = System.currentTimeMillis()
         val domain = extractDomain(series.sourceUrl)
 
@@ -136,24 +151,16 @@ class ChapterDetectionService(
             )
         }
 
-        // 2. Identify source adapter
-        val adapter = sourceRegistry.getAdapterForUrl(series.sourceUrl)
-            ?: sourceRegistry.getAdapterById(series.sourceId)
-
-        if (adapter == null) {
-            val status = "UNSUPPORTED_SOURCE"
-            val error = "No compatible adapter for source URL: ${series.sourceUrl}"
-            seriesDao.updateCheckStatus(series.id, now, status, error)
+        // 2. Resolve a supported adapter from the URL and fetch on the source manager's IO dispatcher.
+        val fetchResult = sourceManager.fetchChapters(series.sourceUrl)
+        if (privacyManager.isPrivateSessionActive()) {
             return DetectionResult(
                 seriesId = series.id,
                 seriesTitle = series.title,
-                status = status,
-                errorMessage = error
+                status = "PRIVATE_SESSION_SUPPRESSED",
+                errorMessage = "Automatic tracking is paused while private browsing is active"
             )
         }
-
-        // 3. Fetch chapter listing
-        val fetchResult = adapter.fetchChapters(series.sourceUrl)
 
         return when (fetchResult) {
             is SourceResult.Success -> {
@@ -242,20 +249,12 @@ class ChapterDetectionService(
         checkTimestamp: Long
     ): DetectionResult {
         val existingChapters = chapterDao.getChaptersForSeriesSync(series.id)
+        val hasReleaseBaseline = series.lastCheckStatus in setOf("SUCCESS", "NO_NEW_CHAPTERS") ||
+            series.latestChapterIdentifier.isNotBlank() && series.latestChapterIdentifier != "0"
         val unseenChapters = ChapterNormalizer.findUnseenChapters(existingChapters, fetchedChapters)
 
-        if (unseenChapters.isEmpty()) {
-            seriesDao.updateCheckStatus(series.id, checkTimestamp, "NO_NEW_CHAPTERS", null)
-            return DetectionResult(
-                seriesId = series.id,
-                seriesTitle = series.title,
-                status = "NO_NEW_CHAPTERS",
-                newChaptersCount = 0,
-                latestDetectedIdentifier = series.latestChapterIdentifier
-            )
-        }
-
-        // Store new chapter records in chapters table
+        // A first successful listing establishes a baseline. Its entries are genuine fetched release
+        // rows, but are not "new" since this app began monitoring; never alert on the whole archive.
         val newEntities = unseenChapters.map { ch ->
             ChapterEntity(
                 seriesId = series.id,
@@ -268,12 +267,24 @@ class ChapterDetectionService(
                 isRead = false
             )
         }
-        chapterDao.insertAll(newEntities)
+        val insertedIds = chapterDao.insertAll(newEntities)
+        val insertedChapters = unseenChapters.zip(insertedIds)
+            .filter { (_, insertedId) -> insertedId > 0L }
+            .map { (chapter, _) -> chapter }
+        if (insertedChapters.isEmpty()) {
+            seriesDao.updateCheckStatus(series.id, checkTimestamp, "NO_NEW_CHAPTERS", null)
+            return DetectionResult(
+                seriesId = series.id,
+                seriesTitle = series.title,
+                status = "NO_NEW_CHAPTERS",
+                latestDetectedIdentifier = series.latestChapterIdentifier
+            )
+        }
 
-        // Find the newest chapter
-        val latestCandidate = unseenChapters.last()
+        val allStoredChapters = chapterDao.getChaptersForSeriesSync(series.id)
+        val latestCandidate = insertedChapters.last()
         val latestIden = latestCandidate.identifier
-        val totalCount = existingChapters.size + unseenChapters.size
+        val totalCount = allStoredChapters.size
 
         // Update the series' latest detected chapter and set hasUnreadNewChapter = true
         seriesDao.updateLatestChapter(
@@ -286,8 +297,8 @@ class ChapterDetectionService(
         seriesDao.updateCheckStatus(series.id, checkTimestamp, "SUCCESS", null)
 
         // Queue notifications if series notifications are enabled AND not in private session
-        if (series.notificationsEnabled && !privacyManager.isPrivateSessionActive()) {
-            for (ch in unseenChapters) {
+        if (series.notificationsEnabled && notificationsEnabled() && !privacyManager.isPrivateSessionActive()) {
+            for (ch in insertedChapters) {
                 // Prevent duplicate notifications
                 val existingNotifCount = notificationDao.hasNotification(series.id, ch.identifier)
                 if (existingNotifCount == 0) {
@@ -311,7 +322,6 @@ class ChapterDetectionService(
                             manhwaTitle = series.title,
                             chapterTitle = ch.title,
                             chapterIdentifier = ch.identifier,
-                            chapterNumber = ch.number ?: (totalCount.toFloat()),
                             url = ch.url.ifBlank { series.sourceUrl }
                         )
                     }
@@ -323,7 +333,7 @@ class ChapterDetectionService(
             seriesId = series.id,
             seriesTitle = series.title,
             status = "SUCCESS",
-            newChaptersCount = unseenChapters.size,
+            newChaptersCount = insertedChapters.size,
             latestDetectedIdentifier = latestIden
         )
     }
@@ -351,5 +361,9 @@ class ChapterDetectionService(
         } catch (_: Exception) {
             "generic"
         }
+    }
+
+    private companion object {
+        val SERIES_LOCKS = ConcurrentHashMap<Long, Mutex>()
     }
 }

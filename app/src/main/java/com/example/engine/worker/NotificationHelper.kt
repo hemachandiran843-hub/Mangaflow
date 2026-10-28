@@ -50,7 +50,6 @@ object NotificationHelper {
         manhwaTitle: String,
         chapterTitle: String = "",
         chapterIdentifier: String = "",
-        chapterNumber: Float = 1.0f,
         url: String
     ) {
         if (!hasNotificationPermission(context)) return
@@ -109,7 +108,6 @@ object NotificationHelper {
             manhwaTitle = manhwaTitle,
             chapterTitle = "Chapter ${newChapter.toInt()}",
             chapterIdentifier = newChapter.toInt().toString(),
-            chapterNumber = newChapter,
             url = url
         )
     }

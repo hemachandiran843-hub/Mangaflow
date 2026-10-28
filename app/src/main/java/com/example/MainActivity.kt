@@ -8,6 +8,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.navigation.AppNavigation
@@ -16,12 +17,17 @@ import com.example.ui.screens.settings.SettingsViewModel
 import com.example.ui.theme.MangaFlowTheme
 
 class MainActivity : ComponentActivity() {
+    private val externalOpenUrl = mutableStateOf<String?>(null)
+    private val externalOpenRequestId = mutableStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        val openUrl = intent?.getStringExtra("OPEN_URL")
+        externalOpenUrl.value = intent?.getStringExtra("OPEN_URL")
+        if (!externalOpenUrl.value.isNullOrBlank()) {
+            externalOpenRequestId.value += 1L
+        }
 
         setContent {
             val app = MangaFlowApp.instance
@@ -29,11 +35,6 @@ class MainActivity : ComponentActivity() {
             val browserViewModel: BrowserViewModel = viewModel()
             val settingsViewModel: SettingsViewModel = viewModel()
             val themeState by settingsViewModel.themeState.collectAsState()
-
-            // If launched from a new chapter release notification
-            if (!openUrl.isNullOrBlank()) {
-                browserViewModel.submitAddress(openUrl)
-            }
 
             MangaFlowTheme(
                 isDarkTheme = themeState.isDark,
@@ -43,6 +44,8 @@ class MainActivity : ComponentActivity() {
                 AppNavigation(
                     browserViewModel = browserViewModel,
                     settingsViewModel = settingsViewModel,
+                    initialOpenUrl = externalOpenUrl.value,
+                    openUrlRequestId = externalOpenRequestId.value,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -54,9 +57,8 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         val openUrl = intent.getStringExtra("OPEN_URL")
         if (!openUrl.isNullOrBlank()) {
-            MangaFlowApp.instance.browserSessionManager.updateCurrentTab {
-                it.copy(url = openUrl)
-            }
+            externalOpenUrl.value = openUrl
+            externalOpenRequestId.value += 1L
         }
     }
 }

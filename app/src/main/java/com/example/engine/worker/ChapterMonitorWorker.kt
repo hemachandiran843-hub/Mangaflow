@@ -27,21 +27,26 @@ class ChapterMonitorWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
             val app = try { MangaFlowApp.instance } catch (_: Exception) { null }
-            if (app != null) {
-                app.chapterDetectionService.checkAllSeries(force = false)
-            } else {
-                // Fallback for isolated background invocation
-                val db = MangaFlowDatabase.getDatabase(applicationContext)
-                val service = com.example.engine.source.ChapterDetectionService(
-                    seriesDao = db.seriesDao(),
-                    chapterDao = db.chapterDao(),
-                    notificationDao = db.notificationDao(),
-                    sourceRegistry = com.example.engine.source.SourceRegistry(),
-                    privacyManager = com.example.engine.privacy.PrivacyManager(),
-                    appContext = applicationContext
-                )
-                service.checkAllSeries(force = false)
+            val db = app?.database ?: MangaFlowDatabase.getDatabase(applicationContext)
+            val settingsDao = db.appSettingDao()
+            if (settingsDao.getSetting("CHAPTER_MONITORING_ENABLED")?.toBoolean() == false) {
+                return@withContext Result.success()
             }
+            val notificationsAllowed =
+                settingsDao.getSetting("NEW_CHAPTER_NOTIFICATIONS_ENABLED")?.toBoolean() ?: true
+            val registry = app?.sourceRegistry ?: com.example.engine.source.SourceRegistry()
+            val sourceManager = app?.sourceManager ?: com.example.engine.source.SourceManager(registry)
+            val service = app?.chapterDetectionService ?: com.example.engine.source.ChapterDetectionService(
+                seriesDao = db.seriesDao(),
+                chapterDao = db.chapterDao(),
+                notificationDao = db.notificationDao(),
+                sourceRegistry = registry,
+                privacyManager = app?.privacyManager ?: com.example.engine.privacy.PrivacyManager(),
+                appContext = applicationContext,
+                notificationsEnabled = { notificationsAllowed },
+                sourceManager = sourceManager
+            )
+            service.checkAllSeries(force = false)
             Result.success()
         } catch (_: Exception) {
             Result.retry()

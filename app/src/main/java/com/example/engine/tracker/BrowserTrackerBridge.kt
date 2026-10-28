@@ -21,10 +21,7 @@ interface BrowserTrackerBridge {
      */
     fun identifySeriesAndChapter(url: String, pageTitle: String?): DetectedManhwa?
 
-    /**
-     * Invoked when a webpage finishes loading in the browser.
-     * Synchronizes reading progress with the library unless browsing in an isolated private tab.
-     */
+    /** Invoked after load to update the transient detection banner only; it never saves progress. */
     fun onPageLoaded(url: String, pageTitle: String?, isPrivate: Boolean)
 
     /**
@@ -40,36 +37,21 @@ interface BrowserTrackerBridge {
 
 class BrowserTrackerBridgeImpl(
     private val manhwaTracker: ManhwaTracker,
-    private val trackerService: ManhwaTrackerService,
-    private val scope: CoroutineScope
+    @Suppress("unused") private val trackerService: ManhwaTrackerService,
+    @Suppress("unused") private val scope: CoroutineScope
 ) : BrowserTrackerBridge {
 
     override val currentDetectedManhwa: StateFlow<DetectedManhwa?> = manhwaTracker.currentDetectedManhwa
 
-    override fun isReadingPage(url: String): Boolean {
-        if (url.startsWith("about:") || url.isBlank()) return false
-        val lower = url.lowercase()
-        return lower.contains("/chapter") ||
-                lower.contains("/ch-") ||
-                lower.contains("/ch.") ||
-                lower.contains("/read/") ||
-                lower.contains("episode_no=") ||
-                lower.contains("episodeno=")
-    }
+    override fun isReadingPage(url: String): Boolean =
+        !url.startsWith("about:", ignoreCase = true) && identifySeriesAndChapter(url, null) != null
 
     override fun identifySeriesAndChapter(url: String, pageTitle: String?): DetectedManhwa? {
         return manhwaTracker.detectFromUrl(url, pageTitle)
     }
 
     override fun onPageLoaded(url: String, pageTitle: String?, isPrivate: Boolean) {
-        // If private tab, strictly avoid updating tracker or persisting reading state
-        if (isPrivate) {
-            manhwaTracker.clearDetection()
-            return
-        }
-
-        // Delegate to tracker for detection and database sync
-        manhwaTracker.onUrlLoaded(url, pageTitle, isPrivate = false)
+        manhwaTracker.onUrlLoaded(url, pageTitle, isPrivate)
     }
 
     override fun getChapterNavigationUrl(chapterUrl: String): String {

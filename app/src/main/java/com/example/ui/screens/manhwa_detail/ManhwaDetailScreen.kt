@@ -92,12 +92,21 @@ fun ManhwaDetailScreen(
     var notesText by remember { mutableStateOf("") }
     var isCheckingNow by remember { mutableStateOf(false) }
     var checkFeedback by remember { mutableStateOf<String?>(null) }
+    var manualChapterIdentifier by remember(manhwaId) { mutableStateOf("") }
+    var manualChapterTitle by remember(manhwaId) { mutableStateOf("") }
+    var manualChapterUrl by remember(manhwaId) { mutableStateOf("") }
+    var isSavingManualProgress by remember { mutableStateOf(false) }
+    var manualProgressFeedback by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(manhwa) {
         notesText = manhwa?.notes ?: ""
     }
 
     val currentManhwa = manhwa
+    val sourceAdapter = currentManhwa?.let { app.sourceManager.adapterForUrl(it.sourceUrl) }
+    val automaticTrackingAvailable = sourceAdapter?.capabilities?.let {
+        it.supportsChapterList && it.supportsUpdateDetection
+    } == true
 
     if (currentManhwa == null) {
         Box(
@@ -275,8 +284,7 @@ fun ManhwaDetailScreen(
 
             // Source Monitoring & Updates Section
             item {
-                val adapter = app.sourceRegistry.getAdapterForUrl(currentManhwa.sourceUrl)
-                    ?: app.sourceRegistry.getAdapterById(currentManhwa.sourceId)
+                val adapter = sourceAdapter
 
                 Card(
                     shape = RoundedCornerShape(14.dp),
@@ -292,7 +300,7 @@ fun ManhwaDetailScreen(
                             Column {
                                 Text("Chapter Monitoring", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                                 Text(
-                                    text = "Adapter: ${adapter?.displayName ?: "Standard Web"}",
+                                    text = "Adapter: ${adapter?.displayName ?: "Unsupported source"}",
                                     color = MangaSecondary,
                                     fontSize = 11.sp
                                 )
@@ -314,7 +322,7 @@ fun ManhwaDetailScreen(
                                         }
                                     }
                                 },
-                                enabled = !isCheckingNow,
+                                enabled = !isCheckingNow && automaticTrackingAvailable,
                                 colors = ButtonDefaults.buttonColors(containerColor = MangaPrimary),
                                 shape = RoundedCornerShape(8.dp),
                                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
@@ -327,6 +335,16 @@ fun ManhwaDetailScreen(
                                     Text("Check Now", fontSize = 11.sp)
                                 }
                             }
+                        }
+
+                        if (!automaticTrackingAvailable) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                "This source has no verified automatic release adapter. Browsing still works; use manual chapter progress below.",
+                                color = TextSecondary,
+                                fontSize = 10.sp,
+                                lineHeight = 14.sp
+                            )
                         }
 
                         if (checkFeedback != null) {
@@ -353,6 +371,7 @@ fun ManhwaDetailScreen(
                             }
                             Switch(
                                 checked = currentManhwa.isMonitoringEnabled,
+                                enabled = automaticTrackingAvailable,
                                 onCheckedChange = { isEnabled ->
                                     scope.launch {
                                         repo.updateMonitoringSettings(
@@ -407,6 +426,87 @@ fun ManhwaDetailScreen(
                                         (if (currentManhwa.lastCheckError != null) " (${currentManhwa.lastCheckError})" else ""),
                                 color = if (currentManhwa.lastCheckStatus in listOf("SUCCESS", "NO_NEW_CHAPTERS")) TextSecondary else MaterialTheme.colorScheme.error,
                                 fontSize = 10.sp
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Text("Manual chapter progress", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "Use this for unsupported sites, or when you want to explicitly mark a chapter read. This does not claim the source has a verified release feed.",
+                            color = TextSecondary,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = manualChapterIdentifier,
+                            onValueChange = { manualChapterIdentifier = it },
+                            label = { Text("Chapter number or ID *") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = manualChapterTitle,
+                            onValueChange = { manualChapterTitle = it },
+                            label = { Text("Title (optional)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = manualChapterUrl,
+                            onValueChange = { manualChapterUrl = it },
+                            label = { Text("Chapter URL (optional)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    isSavingManualProgress = true
+                                    manualProgressFeedback = null
+                                    try {
+                                        app.trackerService.markManualChapterRead(
+                                            seriesId = currentManhwa.id,
+                                            identifier = manualChapterIdentifier,
+                                            title = manualChapterTitle,
+                                            chapterUrl = manualChapterUrl.takeIf { it.isNotBlank() }
+                                        )
+                                        manualProgressFeedback = "Chapter marked read."
+                                        manualChapterIdentifier = ""
+                                        manualChapterTitle = ""
+                                        manualChapterUrl = ""
+                                    } catch (error: Exception) {
+                                        manualProgressFeedback = error.message ?: "Could not save manual progress."
+                                    } finally {
+                                        isSavingManualProgress = false
+                                    }
+                                }
+                            },
+                            enabled = manualChapterIdentifier.isNotBlank() && !isSavingManualProgress,
+                            colors = ButtonDefaults.buttonColors(containerColor = MangaPrimary),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (isSavingManualProgress) "Saving…" else "Mark chapter read", fontSize = 12.sp)
+                        }
+                        manualProgressFeedback?.let { feedback ->
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                feedback,
+                                color = if (feedback == "Chapter marked read.") MangaSecondary else MaterialTheme.colorScheme.error,
+                                fontSize = 11.sp
                             )
                         }
                     }

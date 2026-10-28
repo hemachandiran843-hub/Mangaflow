@@ -24,10 +24,14 @@ data class BrowserTab(
 
 data class DetectedManhwa(
     val title: String,
-    val chapterNumber: Float,
+    val chapterNumber: Float?,
     val chapterTitle: String = "",
     val sourceUrl: String,
-    val coverUrl: String? = null
+    val coverUrl: String? = null,
+    val chapterIdentifier: String = chapterNumber?.toString()?.removeSuffix(".0") ?: "unknown",
+    val chapterUrl: String = sourceUrl,
+    val confidence: Float = 0.5f,
+    val sourceId: String = "open_web"
 )
 
 data class OcrBox(

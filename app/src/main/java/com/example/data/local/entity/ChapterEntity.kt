@@ -16,7 +16,7 @@ import androidx.room.PrimaryKey
         )
     ],
     indices = [
-        Index(value = ["seriesId", "chapterUrl"], unique = true),
+        Index(value = ["seriesId", "chapterUrl"]),
         Index(value = ["seriesId", "chapterIdentifier"], unique = true),
         Index(value = ["seriesId", "isRead"])
     ]

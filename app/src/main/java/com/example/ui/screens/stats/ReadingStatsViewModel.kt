@@ -8,7 +8,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 
 data class DailyStatItem(
     val dayLabel: String,
@@ -24,7 +26,6 @@ data class StatsSummary(
 )
 
 class ReadingStatsViewModel : ViewModel() {
-
     private val app = MangaFlowApp.instance
     private val trackerService = app.trackerService
     private val statsRepo = app.readingStatsRepository
@@ -32,47 +33,54 @@ class ReadingStatsViewModel : ViewModel() {
     val statsSummary: StateFlow<StatsSummary> = combine(
         trackerService.getReadingStatistics(),
         statsRepo.allStats
-    ) { stats, sessions ->
-        val today = LocalDate.now().toEpochDay()
-        val dayMap = sessions.associateBy { it.dateEpochDay }
-
-        // Compute streak
-        var streak = 0
-        var checkDay = today
-        while (dayMap.containsKey(checkDay) && (((dayMap[checkDay]?.durationSeconds ?: 0) > 0) || ((dayMap[checkDay]?.chaptersReadCount ?: 0) > 0))) {
-            streak++
-            checkDay--
-        }
-
-        val dayNames = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-        val dailyItems = (6 downTo 0).map { offset ->
-            val epoch = today - offset
-            val date = LocalDate.ofEpochDay(epoch)
-            val stat = dayMap[epoch]
-            val dayName = dayNames[date.dayOfWeek.value - 1]
-            val mins = if (stat != null) {
-                (stat.durationSeconds / 60).coerceAtLeast(1)
-            } else if (offset == 0 && stats.totalChaptersRead > 0) {
-                25
-            } else {
-                0
-            }
+    ) { statistics, sessions ->
+        val zone = ZoneId.systemDefault()
+        val today = LocalDate.now(zone)
+        val durationSecondsByDay = sessions
+            .filter { it.durationSeconds > 0 }
+            .groupBy { it.dateEpochDay }
+            .mapValues { (_, rows) -> rows.sumOf { it.durationSeconds } }
+        val chapterCountsByDay = mutableMapOf<Long, Int>()
+        val days = (6 downTo 0).map { offset ->
+            val date = today.minusDays(offset.toLong())
+            val start = date.atStartOfDay(zone).toInstant().toEpochMilli()
+            val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+            val chapters = trackerService.getReadChapterCountBetween(start, end).coerceAtLeast(0)
+            val epochDay = date.toEpochDay()
+            chapterCountsByDay[epochDay] = chapters
+            val seconds = durationSecondsByDay[epochDay] ?: 0
             DailyStatItem(
-                dayLabel = dayName,
-                minutes = mins,
-                chapters = stat?.chaptersReadCount ?: (if (offset == 0 && stats.totalChaptersRead > 0) 3 else 0),
+                dayLabel = DAY_NAMES[date.dayOfWeek.value - 1],
+                minutes = (seconds / 60).coerceAtLeast(0),
+                chapters = chapters,
                 isToday = offset == 0
             )
         }
 
+        val activeDays = durationSecondsByDay.filterValues { it > 0 }.keys.toMutableSet()
+        trackerService.getReadChapterTimestamps().forEach { timestamp ->
+            activeDays += Instant.ofEpochMilli(timestamp).atZone(zone).toLocalDate().toEpochDay()
+        }
+        var checkDay = today.toEpochDay()
+        if (checkDay !in activeDays) checkDay--
+        var streak = 0
+        while (checkDay in activeDays) {
+            streak++
+            checkDay--
+        }
+
         StatsSummary(
-            statistics = stats,
-            streakDays = if (streak > 0) streak else (if (stats.totalChaptersRead > 0) 1 else 0),
-            dailyList = dailyItems
+            statistics = statistics,
+            streakDays = streak,
+            dailyList = days
         )
     }.stateIn(
         viewModelScope,
-        SharingStarted.WhileSubscribed(5000),
+        SharingStarted.WhileSubscribed(5_000),
         StatsSummary()
     )
+
+    private companion object {
+        val DAY_NAMES = listOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    }
 }

@@ -234,6 +234,34 @@ class ChapterDetectionAndSourcesTest {
     }
 
     @Test
+    fun testGlobalNotificationPreferenceSuppressesQueuedAlerts() = runBlocking {
+        val seriesId = database.seriesDao().insert(
+            SeriesEntity(
+                title = "Silent Series",
+                sourceUrl = "https://testsource.example.com/silent",
+                readingStatus = "READING",
+                latestChapterIdentifier = "1"
+            )
+        )
+        mockAdapter.returnedResult = SourceResult.Success(
+            listOf(SourceChapter(identifier = "2", number = 2f, title = "Chapter 2", url = "https://testsource.example.com/silent/2"))
+        )
+        val notificationsDisabledService = ChapterDetectionService(
+            seriesDao = database.seriesDao(),
+            chapterDao = database.chapterDao(),
+            notificationDao = database.notificationDao(),
+            sourceRegistry = sourceRegistry,
+            privacyManager = privacyManager,
+            appContext = context,
+            notificationsEnabled = { false }
+        )
+
+        notificationsDisabledService.checkSeries(seriesId, force = true)
+
+        assertEquals(0, database.notificationDao().getAllNotifications().first().size)
+    }
+
+    @Test
     fun testPrivateBrowsingIsolation_suppressesNotifications() = runBlocking {
         val seriesId = database.seriesDao().insert(
             SeriesEntity(

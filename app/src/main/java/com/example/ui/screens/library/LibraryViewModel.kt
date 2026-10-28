@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.MangaFlowApp
 import com.example.data.local.entity.SeriesEntity
+import com.example.data.tracker.LibraryImportPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -164,13 +165,6 @@ class LibraryViewModel : ViewModel() {
         }
     }
 
-    fun loadSampleData() {
-        viewModelScope.launch {
-            trackerService.loadSampleData()
-            _actionMessage.value = "Sample manhwa library loaded"
-        }
-    }
-
     fun clearAllData() {
         viewModelScope.launch {
             trackerService.clearAllData()
@@ -185,13 +179,25 @@ class LibraryViewModel : ViewModel() {
         }
     }
 
+    fun previewLibraryImport(json: String, onPreview: (Result<LibraryImportPreview>) -> Unit) {
+        viewModelScope.launch {
+            onPreview(trackerService.previewLibraryJson(json))
+        }
+    }
+
+    fun applyLibraryImport(preview: LibraryImportPreview, onComplete: (Result<Int>) -> Unit) {
+        viewModelScope.launch {
+            val result = trackerService.applyLibraryImport(preview)
+            if (result.isSuccess) _actionMessage.value = "Imported ${result.getOrNull()} new series; existing entries were left unchanged"
+            onComplete(result)
+        }
+    }
+
     fun importLibrary(json: String, onComplete: (Result<Int>) -> Unit) {
         viewModelScope.launch {
-            val res = trackerService.importLibraryJson(json)
-            if (res.isSuccess) {
-                _actionMessage.value = "Successfully imported ${res.getOrNull()} titles"
-            }
-            onComplete(res)
+            val result = trackerService.importLibraryJson(json)
+            if (result.isSuccess) _actionMessage.value = "Successfully imported ${result.getOrNull()} titles"
+            onComplete(result)
         }
     }
 }

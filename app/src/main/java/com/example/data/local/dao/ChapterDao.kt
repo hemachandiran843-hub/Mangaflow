@@ -57,6 +57,12 @@ interface ChapterDao {
     @Query("SELECT COUNT(*) FROM chapters WHERE isRead = 1")
     fun countTotalChaptersRead(): Flow<Int>
 
+    @Query("SELECT COUNT(*) FROM chapters WHERE isRead = 1 AND lastReadAt >= :startInclusive AND lastReadAt < :endExclusive")
+    suspend fun countReadChaptersBetween(startInclusive: Long, endExclusive: Long): Int
+
+    @Query("SELECT lastReadAt FROM chapters WHERE isRead = 1 AND lastReadAt > 0")
+    suspend fun getReadChapterTimestamps(): List<Long>
+
     @Query("SELECT COUNT(*) FROM chapters WHERE isRead = 0")
     fun countUnreadChapters(): Flow<Int>
 

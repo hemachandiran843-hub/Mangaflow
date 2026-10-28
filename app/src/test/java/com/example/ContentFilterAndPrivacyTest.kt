@@ -1,6 +1,7 @@
 package com.example
 
 import android.content.Context
+import android.os.Bundle
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.MangaFlowDatabase
@@ -63,7 +64,8 @@ class ContentFilterAndPrivacyTest {
             chapterDao = database.chapterDao(),
             readingProgressDao = database.readingProgressDao(),
             readingSessionDao = database.readingSessionDao(),
-            notificationDao = database.notificationDao()
+            notificationDao = database.notificationDao(),
+            database = database
         )
 
         manhwaTracker = ManhwaTracker(
@@ -165,7 +167,7 @@ class ContentFilterAndPrivacyTest {
             /ad_interstitial_video.js
             @@||allowed-partner.com^
             [Malformed Header Line]
-            
+
         """.trimIndent()
 
         val updateResult = filterEngine.updateFilterList(easyListSample)
@@ -275,12 +277,21 @@ class ContentFilterAndPrivacyTest {
         val afterSeries = database.seriesDao().getSeriesByIdSync(seriesId)
         assertEquals(initialLastRead, afterSeries!!.lastReadChapterIdentifier)
 
-        // Now simulate reading in NORMAL mode
+        // A normal page load detects a chapter but does not silently update reading progress.
         trackerBridge.onPageLoaded(privateChapterUrl, "Solo Leveling - Chapter 50", isPrivate = false)
-        kotlinx.coroutines.delay(150)
+        kotlinx.coroutines.delay(50)
+        assertEquals(initialLastRead, database.seriesDao().getSeriesByIdSync(seriesId)!!.lastReadChapterIdentifier)
+        val detection = trackerBridge.currentDetectedManhwa.value
+        assertNotNull(detection)
 
+        // Progress changes only after an explicit user confirmation; no fabricated reading duration is added.
+        trackerService.markDetectedChapterRead(seriesId, detection!!)
+        val afterConfirmedRead = database.seriesDao().getSeriesByIdSync(seriesId)
+        assertEquals("50", afterConfirmedRead!!.lastReadChapterIdentifier)
+        val chapter = database.chapterDao().findBySeriesAndIdentifier(seriesId, "50")
+        assertTrue(chapter?.isRead == true)
         val normalSessions = database.readingSessionDao().getAllSessions().first().filter { it.seriesId == seriesId }
-        assertTrue(normalSessions.isNotEmpty())
+        assertEquals(0, normalSessions.size)
     }
 
     @Test
@@ -314,6 +325,30 @@ class ContentFilterAndPrivacyTest {
         assertEquals(0, sessionManager.privateTabs.value.size)
         assertFalse(sessionManager.isPrivateActive.value)
         assertTrue(sessionManager.normalTabs.value.any { it.id == sessionManager.currentTabId.value })
+    }
+
+    @Test
+    fun testPrivateTabGroupsReceiveFreshProfileIdentifiers() {
+        val first = sessionManager.openNewTab("https://private-one.example", isPrivate = true)
+        assertNotNull(first)
+        val firstProfile = privacyManager.getPrivateProfileName()
+        sessionManager.closeAllPrivateTabs(context)
+
+        val second = sessionManager.openNewTab("https://private-two.example", isPrivate = true)
+        assertNotNull(second)
+        val secondProfile = privacyManager.getPrivateProfileName()
+        assertFalse(firstProfile == secondProfile)
+    }
+
+    @Test
+    fun testTabSnapshotsAreBoundedForMemory() {
+        val tabs = (1..6).mapNotNull { index ->
+            sessionManager.openNewTab("https://normal-$index.example", isPrivate = false)
+        }
+        tabs.forEach { tab -> sessionManager.saveWebViewState(tab.id, Bundle().apply { putString("url", tab.url) }) }
+
+        assertNull(sessionManager.getWebViewState(tabs.first().id))
+        assertNotNull(sessionManager.getWebViewState(tabs.last().id))
     }
 
     @Test
